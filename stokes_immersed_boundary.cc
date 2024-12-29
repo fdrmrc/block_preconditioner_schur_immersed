@@ -282,6 +282,7 @@ class IBStokesProblem {
   ParameterAcceptorProxy<ALControl> augmented_lagrangian_control;
 
   SparsityPattern coupling_sparsity;
+  SparsityPattern coupling_sparsity_t;
   SparsityPattern mass_sparsity;
 
   SparseMatrix<double> mass_matrix;
@@ -289,6 +290,7 @@ class IBStokesProblem {
 
   SparseMatrix<double> embedded_stiffness_matrix;
   SparseMatrix<double> coupling_matrix;
+  SparseMatrix<double> coupling_matrix_t;
 
   BlockSparsityPattern sparsity_pattern_stokes;
   BlockSparseMatrix<double> stokes_matrix;
@@ -625,6 +627,15 @@ void IBStokesProblem<dim, spacedim>::setup_coupling() {
       ComponentMask(), MappingQ1<spacedim>(), *embedded_mapping);
   coupling_sparsity.copy_from(dsp);
   coupling_matrix.reinit(coupling_sparsity);
+
+  // Do the same, but for the transpose
+  DynamicSparsityPattern dsp_t(embedded_dh->n_dofs(), velocity_dh->n_dofs());
+  UtilitiesAL::create_coupling_sparsity_pattern_transpose(
+      *space_grid_tools_cache, *velocity_dh, *embedded_dh, quad, dsp_t,
+      constraints, ComponentMask(), ComponentMask(), *embedded_mapping,
+      AffineConstraints<double>());
+  coupling_sparsity_t.copy_from(dsp_t);
+  coupling_matrix_t.reinit(coupling_sparsity_t);
 }
 
 template <int dim, int spacedim>
@@ -747,6 +758,12 @@ void IBStokesProblem<dim, spacedim>::assemble_stokes() {
         ComponentMask(), ComponentMask(), MappingQ1<spacedim>(),
         *embedded_mapping);
 
+    // Assemble the transpose
+    UtilitiesAL::create_coupling_mass_matrix_transpose(
+        *space_grid_tools_cache, *velocity_dh, *embedded_dh, quad,
+        coupling_matrix_t, constraints, ComponentMask(), ComponentMask(),
+        *embedded_mapping, AffineConstraints<double>());
+
     MatrixTools::create_mass_matrix(*embedded_mapping, *embedded_dh,
                                     QGauss<dim>(2 * embedded_fe->degree + 1),
                                     mass_matrix_immersed);
@@ -765,6 +782,11 @@ void IBStokesProblem<dim, spacedim>::assemble_stokes() {
           << stokes_matrix.block(1, 0).n() << ")" << std::endl;
   deallog << "C dimensions (" << coupling_matrix.n() << ","
           << coupling_matrix.m() << ")" << std::endl;
+
+#ifdef DEBUG
+  deallog << "C dimensions (check) (" << coupling_matrix_t.m() << ","
+          << coupling_matrix_t.n() << ")" << std::endl;
+#endif
 }
 
 void output_double_number(double input, const std::string &text) {
@@ -873,7 +895,8 @@ void IBStokesProblem<dim, spacedim>::solve() {
     auto Bt = linear_operator(stokes_matrix.block(0, 1));
     auto B = linear_operator(stokes_matrix.block(1, 0));
     auto Ct = linear_operator(coupling_matrix);
-    auto C = transpose_operator(Ct);
+    // auto C = transpose_operator(Ct);
+    auto C = linear_operator(coupling_matrix_t);
     auto M = linear_operator(mass_matrix_immersed);
     auto Mp = linear_operator(preconditioner_matrix.block(1, 1));
 
@@ -963,11 +986,16 @@ void IBStokesProblem<dim, spacedim>::solve() {
             1. / (mass_matrix_immersed.diag_element(i) *
                   mass_matrix_immersed.diag_element(i));
 
-      build_AMG_augmented_block(*velocity_dh, *space_dh, coupling_matrix,
-                                stokes_matrix.block(0, 0), coupling_sparsity,
-                                inverse_squares_multiplier, constraints, gamma,
-                                prec_amg_aug);
-      // prec_amg_aug.initialize(stokes_matrix.block(0, 0));
+      UtilitiesAL::create_preconditioner_for_augmented_block(
+          *velocity_dh, *space_dh, stokes_matrix.block(0, 0), coupling_matrix_t,
+          coupling_matrix, inverse_squares_multiplier, constraints, gamma,
+          prec_amg_aug);
+
+      // build_AMG_augmented_block(*velocity_dh, *space_dh, coupling_matrix,
+      //                           stokes_matrix.block(0, 0), coupling_sparsity,
+      //                           inverse_squares_multiplier, constraints,
+      //                           gamma, prec_amg_aug);
+
       Aug_inv = inverse_operator(Aug, solver_lagrangian, prec_amg_aug);
     } else if (augmented_lagrangian_control.AMG_preconditioner_augmented ==
                    false &&
