@@ -8,6 +8,7 @@
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/sparsity_pattern.h>
+#include <deal.II/lac/trilinos_sparsity_pattern.h>
 #include <deal.II/lac/utilities.h>
 #include <deal.II/lac/vector.h>
 
@@ -614,87 +615,270 @@ void create_preconditioner_for_augmented_block(
   // TODO: add asserts on dimensions of operators
   Assert(dim <= spacedim, ExcImpossibleInDimSpacedim(dim, spacedim));
 
-  // Fill sparsity of augmented block
-  const auto &sparsity_Ct = Ct.get_sparsity_pattern();
-  const auto &sparsity_C = C.get_sparsity_pattern();
+  if constexpr (std::is_same_v<SparseMatrix<double>, MatrixType>) {
+    // Fill sparsity of augmented block
+    const auto &sparsity_Ct = Ct.get_sparsity_pattern();
+    const auto &sparsity_C = C.get_sparsity_pattern();
 
-  DynamicSparsityPattern augmented_dsp(velocity_dh.n_dofs(),
-                                       velocity_dh.n_dofs());
-  augmented_dsp.compute_mmult_pattern(sparsity_Ct, sparsity_C);
+    DynamicSparsityPattern augmented_dsp(velocity_dh.n_dofs(),
+                                         velocity_dh.n_dofs());
+    augmented_dsp.compute_mmult_pattern(sparsity_Ct, sparsity_C);
 #ifdef DEBUG
-  std::cout << "Computed mmult pattern" << std::endl;
+    std::cout << "Computed mmult pattern" << std::endl;
 #endif
 
-  // Now you have the sparsity of C^T * C. We need to add entries from the (0,0)
-  // block
-  std::vector<unsigned int> block_component(spacedim + 1, 0);
-  block_component[spacedim] = 1;
-  const std::vector<types::global_dof_index> dofs_per_block =
-      DoFTools::count_dofs_per_fe_block(space_dh, block_component);
-  const types::global_dof_index n_velocity_dofs = dofs_per_block[0];
+    // Now you have the sparsity of C^T * C. We need to add entries from the
+    // (0,0) block
+    std::vector<unsigned int> block_component(spacedim + 1, 0);
+    block_component[spacedim] = 1;
+    const std::vector<types::global_dof_index> dofs_per_block =
+        DoFTools::count_dofs_per_fe_block(space_dh, block_component);
+    const types::global_dof_index n_velocity_dofs = dofs_per_block[0];
 
-  const auto &sparsity_pattern_velocity_block =
-      velocity_block.get_sparsity_pattern();
+    const auto &sparsity_pattern_velocity_block =
+        velocity_block.get_sparsity_pattern();
 
-  for (unsigned int row = 0; row < n_velocity_dofs; ++row)
-    for (SparsityPattern::iterator it =
-             sparsity_pattern_velocity_block.begin(row);
-         it != sparsity_pattern_velocity_block.end(row); ++it)
-      augmented_dsp.add(row, it->column());
-
-#ifdef DEBUG
-  std::cout << "Populated sparsity pattern" << std::endl;
-#endif
-
-  SparsityPattern augmented_sp;
-  augmented_sp.copy_from(augmented_dsp);
-
-  MatrixType augmented_block;
-  augmented_block.reinit(augmented_sp);
-  Ct.mmult(augmented_block, C, scaling_vector,
-           false);  // aug = C^T *scaling_vector*C
+    for (unsigned int row = 0; row < n_velocity_dofs; ++row)
+      for (SparsityPattern::iterator it =
+               sparsity_pattern_velocity_block.begin(row);
+           it != sparsity_pattern_velocity_block.end(row); ++it)
+        augmented_dsp.add(row, it->column());
 
 #ifdef DEBUG
-  std::cout << "Performed mat-mat multiplication" << std::endl;
+    std::cout << "Populated sparsity pattern" << std::endl;
 #endif
 
-  SparseMatrix<double> stiffness_matrix_copy;
-  stiffness_matrix_copy.reinit(augmented_sp);
-  const auto &space_fe = velocity_dh.get_fe();
-  MatrixTools::create_laplace_matrix(
-      velocity_dh, QGauss<spacedim>(2 * space_fe.degree + 1),
-      stiffness_matrix_copy, static_cast<const Function<spacedim> *>(nullptr),
-      constraints);
+    SparsityPattern augmented_sp;
+    augmented_sp.copy_from(augmented_dsp);
 
-  // MatrixType velocity_matrix;
-  // stiffness_matrix_copy.reinit(augmented_sp);
-  // stiffness_matrix_copy.copy_from(velocity_block);
-  stiffness_matrix_copy.add(gamma, augmented_block);
+    MatrixType augmented_block;
+    augmented_block.reinit(augmented_sp);
+    Ct.mmult(augmented_block, C, scaling_vector,
+             false);  // aug = C^T *scaling_vector*C
 
 #ifdef DEBUG
-  std::cout << "Performed augmentation" << std::endl;
+    std::cout << "Performed mat-mat multiplication" << std::endl;
 #endif
 
-  if constexpr (std::is_same_v<TrilinosWrappers::PreconditionAMG,
-                               std::remove_reference_t<decltype(prec)>>) {
-    // Extract constant modes as we have a vector valued problem
-    const FEValuesExtractors::Vector velocity_components(0);
-    const std::vector<std::vector<bool>> constant_modes =
-        DoFTools::extract_constant_modes(
-            space_dh, space_dh.get_fe().component_mask(velocity_components));
+    SparseMatrix<double> stiffness_matrix_copy;
+    stiffness_matrix_copy.reinit(augmented_sp);
+    const auto &space_fe = velocity_dh.get_fe();
+    MatrixTools::create_laplace_matrix(
+        velocity_dh, QGauss<spacedim>(2 * space_fe.degree + 1),
+        stiffness_matrix_copy, static_cast<const Function<spacedim> *>(nullptr),
+        constraints);
 
-    TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
-    amg_data.constant_modes = constant_modes;
-    amg_data.elliptic = true;
-    amg_data.higher_order_elements = true;
-    amg_data.smoother_sweeps = 2;
-    amg_data.aggregation_threshold = 0.02;
+    // MatrixType velocity_matrix;
+    // stiffness_matrix_copy.reinit(augmented_sp);
+    // stiffness_matrix_copy.copy_from(velocity_block);
+    stiffness_matrix_copy.add(gamma, augmented_block);
 
-    prec.initialize(stiffness_matrix_copy,
-                    amg_data);  //! actually fill the preconditioner
+#ifdef DEBUG
+    std::cout << "Performed augmentation" << std::endl;
+#endif
+
+    if constexpr (std::is_same_v<TrilinosWrappers::PreconditionAMG,
+                                 std::remove_reference_t<decltype(prec)>>) {
+      // Extract constant modes as we have a vector valued problem
+      const FEValuesExtractors::Vector velocity_components(0);
+      const std::vector<std::vector<bool>> constant_modes =
+          DoFTools::extract_constant_modes(
+              space_dh, space_dh.get_fe().component_mask(velocity_components));
+
+      TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
+      amg_data.constant_modes = constant_modes;
+      amg_data.elliptic = true;
+      amg_data.higher_order_elements = true;
+      amg_data.smoother_sweeps = 2;
+      amg_data.aggregation_threshold = 0.02;
+
+      prec.initialize(stiffness_matrix_copy,
+                      amg_data);  //! actually fill the preconditioner
+    } else {
+      // Only AMG preconditioning supported so far
+      AssertThrow(false, ExcNotImplemented());
+    }
+  } else if constexpr (std::is_same_v<TrilinosWrappers::SparseMatrix,
+                                      MatrixType>) {
+    Assert((std::is_same_v<TrilinosWrappers::MPI::Vector, VectorType>),
+           ExcMessage("You must use Trilinos vectors, as you are using "
+                      "Trilinos matrices."));
+    MatrixType augmented_block;
+    //  The sparsity of augmented_block will be changed by mmult
+    Ct.mmult(augmented_block, C,
+             scaling_vector);  // aug = C^T *scaling_vector*C
+
+    const Epetra_CrsGraph &epetra_graph =
+        augmented_block.trilinos_sparsity_pattern();
+
+    const IndexSet &locally_relevant_dofs =
+        DoFTools::extract_locally_relevant_dofs(velocity_dh);
+    DynamicSparsityPattern dsp(locally_relevant_dofs);
+
+    DoFTools::make_sparsity_pattern(velocity_dh, dsp, constraints, false);
+    SparsityTools::distribute_sparsity_pattern(
+        dsp, velocity_dh.locally_owned_dofs(), velocity_dh.get_communicator(),
+        locally_relevant_dofs);
+
+    const Epetra_CrsMatrix &epetra_matrix = augmented_block.trilinos_matrix();
+    const Epetra_Map &row_map = epetra_matrix.RowMap();
+    for (int i = 0; i < row_map.NumMyElements(); ++i) {
+      const int global_row = row_map.GID(i);
+      int num_entries;
+      int *column_indices;
+
+      epetra_graph.ExtractMyRowView(i, num_entries, column_indices);
+      for (int j = 0; j < num_entries; ++j) {
+        dsp.add(global_row, column_indices[j]);
+      }
+    }
+
+    TrilinosWrappers::SparseMatrix stiffness_matrix_copy;
+    stiffness_matrix_copy.reinit(velocity_dh.locally_owned_dofs(),
+                                 velocity_dh.locally_owned_dofs(), dsp,
+                                 velocity_dh.get_communicator());
+
+    const auto &space_fe = velocity_dh.get_fe();
+    MatrixTools::create_laplace_matrix(
+        velocity_dh, QGauss<spacedim>(2 * space_fe.degree + 1),
+        stiffness_matrix_copy, static_cast<const Function<spacedim> *>(nullptr),
+        constraints);
+
+    stiffness_matrix_copy.add(gamma, augmented_block);
+    if constexpr (std::is_same_v<TrilinosWrappers::PreconditionAMG,
+                                 std::remove_reference_t<decltype(prec)>>) {
+      // Extract constant modes as we have a vector valued problem
+      const FEValuesExtractors::Vector velocity_components(0);
+      const std::vector<std::vector<bool>> constant_modes =
+          DoFTools::extract_constant_modes(
+              space_dh, space_dh.get_fe().component_mask(velocity_components));
+
+      TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
+      amg_data.constant_modes = constant_modes;
+      amg_data.elliptic = true;
+      amg_data.higher_order_elements = true;
+      amg_data.smoother_sweeps = 2;
+      amg_data.aggregation_threshold = 0.02;
+
+      prec.initialize(stiffness_matrix_copy,
+                      amg_data);  //! actually fill the preconditioner
+    } else {
+      // Only AMG preconditioning supported so far
+      AssertThrow(false, ExcNotImplemented());
+    }
   } else {
-    // Only AMG preconditioning supported so far
-    AssertThrow(false, ExcNotImplemented());
+    // PETSc not supported so far.
+    AssertThrow(false, ExcNotImplemented("Matrix type not supported!"));
+  }
+}
+
+template <int dim, int spacedim, typename MatrixType = SparseMatrix<double>,
+          typename VectorType = Vector<typename MatrixType::value_type>,
+          typename PreconditionerType = TrilinosWrappers::PreconditionAMG>
+void create_augmented_block(const DoFHandler<dim, spacedim> &velocity_dh,
+                            const MatrixType &C, const MatrixType &Ct,
+                            const VectorType &scaling_vector,
+                            const AffineConstraints<double> &constraints,
+                            const double gamma, MatrixType &augmented_matrix) {
+  Assert(dim <= spacedim, ExcImpossibleInDimSpacedim(dim, spacedim));
+
+  if constexpr (std::is_same_v<TrilinosWrappers::SparseMatrix, MatrixType>) {
+    Assert((std::is_same_v<TrilinosWrappers::MPI::Vector, VectorType>),
+           ExcMessage("You must use Trilinos vectors, as you are using "
+                      "Trilinos matrices."));
+    MatrixType augmented_block;
+    //  The sparsity of augmented_block will be changed by mmult
+    Ct.mmult(augmented_block, C,
+             scaling_vector);  // aug = C^T *scaling_vector*C
+
+    const Epetra_CrsGraph &epetra_graph =
+        augmented_block.trilinos_sparsity_pattern();
+
+    const IndexSet &locally_relevant_dofs =
+        DoFTools::extract_locally_relevant_dofs(velocity_dh);
+    DynamicSparsityPattern dsp(locally_relevant_dofs);
+
+    DoFTools::make_sparsity_pattern(velocity_dh, dsp, constraints, false);
+    SparsityTools::distribute_sparsity_pattern(
+        dsp, velocity_dh.locally_owned_dofs(), velocity_dh.get_communicator(),
+        locally_relevant_dofs);
+
+    const Epetra_CrsMatrix &epetra_matrix = augmented_block.trilinos_matrix();
+    const Epetra_Map &row_map = epetra_matrix.RowMap();
+    for (int i = 0; i < row_map.NumMyElements(); ++i) {
+      const int global_row = row_map.GID(i);
+      int num_entries;
+      int *column_indices;
+
+      epetra_graph.ExtractMyRowView(i, num_entries, column_indices);
+      for (int j = 0; j < num_entries; ++j) {
+        dsp.add(global_row, column_indices[j]);
+      }
+    }
+
+    augmented_matrix.reinit(velocity_dh.locally_owned_dofs(),
+                            velocity_dh.locally_owned_dofs(), dsp,
+                            velocity_dh.get_communicator());
+
+    const auto &space_fe = velocity_dh.get_fe();
+
+    {
+      const QGauss<spacedim> quadrature_formula(2 * space_fe.degree + 1);
+      FEValues<spacedim> fe_values(space_fe, quadrature_formula,
+                                   update_values | update_gradients |
+                                       update_quadrature_points |
+                                       update_JxW_values);
+
+      const unsigned int dofs_per_cell = space_fe.n_dofs_per_cell();
+      const unsigned int n_q_points = quadrature_formula.size();
+      const FEValuesExtractors::Vector velocities(0);
+      FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
+
+      std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
+
+      for (const auto &cell : velocity_dh.active_cell_iterators())
+        if (cell->is_locally_owned()) {
+          fe_values.reinit(cell);
+
+          cell_matrix = 0.;
+
+          for (unsigned int q_point = 0; q_point < n_q_points; ++q_point) {
+            for (unsigned int i = 0; i < dofs_per_cell; ++i) {
+              for (unsigned int j = 0; j < dofs_per_cell; ++j)
+                cell_matrix(i, j) +=
+                    (scalar_product(
+                         fe_values[velocities].gradient(i, q_point),
+                         fe_values[velocities].gradient(j, q_point)) +
+                     gamma * fe_values[velocities].divergence(i, q_point) *
+                         fe_values[velocities].divergence(j, q_point)) *
+                    fe_values.JxW(q_point);
+              // cell_matrix(i, j) += fe_values.shape_grad(i, q_point) *
+              //                      fe_values.shape_grad(j, q_point) *
+              //                      fe_values.JxW(q_point);
+              // (fe_values.shape_grad(i, q_point) *
+              //      fe_values.shape_grad(j, q_point) +
+              //  gamma * fe_values[velocities].divergence(i, q_point) *
+              //      fe_values[velocities].divergence(j, q_point)) *
+              // fe_values.JxW(q_point);
+            }
+          }
+
+          cell->get_dof_indices(local_dof_indices);
+          constraints.distribute_local_to_global(cell_matrix, local_dof_indices,
+                                                 augmented_matrix);
+        }
+
+      augmented_matrix.compress(VectorOperation::add);
+    }
+    // MatrixTools::create_laplace_matrix(
+    //     velocity_dh, QGauss<spacedim>(2 * space_fe.degree + 1),
+    //     augmented_matrix, static_cast<const Function<spacedim> *>(nullptr),
+    //     constraints);
+
+    augmented_matrix.add(gamma, augmented_block);
+  } else {
+    // PETSc not supported so far.
+    AssertThrow(false, ExcNotImplemented("Matrix type not supported!"));
   }
 }
 
