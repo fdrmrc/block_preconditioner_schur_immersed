@@ -207,6 +207,28 @@ void build_AMG_augmented_block(
   // #endif
 }
 
+std::string deallogname;
+std::ofstream deallogfile;
+inline void mpi_initlog(const bool console = false,
+                        const unsigned int verbosity_level = 10,
+                        const std::ios_base::fmtflags flags =
+                            std::ios::showpoint | std::ios::left) {
+#ifdef DEAL_II_WITH_MPI
+  unsigned int myid = Utilities::MPI::this_mpi_process(MPI_COMM_WORLD);
+  if (myid == 0) {
+    deallogname = "output";
+    deallogfile.open(deallogname.c_str());
+    deallog.attach(deallogfile, true, flags);
+    deallog.depth_console(console ? verbosity_level : 0);
+  }
+#else
+  (void)console;
+  (void)flags;
+  // can't use this function if not using MPI
+  Assert(false, ExcInternalError());
+#endif
+}
+
 namespace UtilitiesAL {
 
 namespace internal {

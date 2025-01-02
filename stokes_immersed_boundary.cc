@@ -182,8 +182,6 @@ class IBStokesProblem {
 
   void output_results();
 
-  void export_results_to_csv_file();
-
   std::unique_ptr<parallel::distributed::Triangulation<spacedim>> space_grid;
   std::unique_ptr<GridTools::Cache<spacedim, spacedim>> space_grid_tools_cache;
   std::unique_ptr<FESystem<spacedim>> velocity_fe;
@@ -451,10 +449,14 @@ void IBStokesProblem<dim, spacedim>::setup_background_dofs() {
 
   space_dh->distribute_dofs(*space_fe);
   velocity_dh->distribute_dofs(*velocity_fe);
-  DoFRenumbering::Cuthill_McKee(*space_dh);
-  DoFRenumbering::Cuthill_McKee(
-      *velocity_dh);  // we need to renumber in the same way we renumbered DoFs
-                      // for velocity
+
+  // Do DoFRenumbering only in serial
+  if (Utilities::MPI::n_mpi_processes(mpi_comm) == 1) {
+    DoFRenumbering::Cuthill_McKee(*space_dh);
+    DoFRenumbering::Cuthill_McKee(
+        *velocity_dh);  // we need to renumber in the same way we renumbered
+                        // DoFs for velocity
+  }
 
   std::vector<unsigned int> block_component(spacedim + 1, 0);
   block_component[spacedim] = 1;
@@ -908,6 +910,7 @@ void IBStokesProblem<dim, spacedim>::solve() {
 
     TrilinosWrappers::SparsityPattern diag_inverse_pressure_sparsity(
         stokes_partitioning[1], mpi_comm);
+
     for (auto dof : stokes_partitioning[1]) {
       diag_inverse_pressure_sparsity.add(dof, dof);  // Add diagonal entry only
     }
@@ -1071,9 +1074,7 @@ void IBStokesProblem<dim, spacedim>::solve() {
     TrilinosWrappers::MPI::Vector tmp;
     tmp.reinit(stokes_partitioning[0], stokes_relevant_partitioning[0],
                mpi_comm);
-    // tmp.reinit(stokes_rhs.block(0).size());
     tmp = gamma * Ct * invW * embedded_rhs;
-    pcout << "Defined tmp for AL" << std::endl;
     system_rhs_block.block(0) = stokes_rhs.block(0);
     system_rhs_block.block(0).add(1., tmp);  // ! augmented
     system_rhs_block.block(1) = stokes_rhs.block(1);
@@ -1091,8 +1092,6 @@ void IBStokesProblem<dim, spacedim>::solve() {
         prec_amg_aug;  // will be initialized only if selected
     if (augmented_lagrangian_control.AMG_preconditioner_augmented == true &&
         augmented_lagrangian_control.grad_div_stabilization == true) {
-      // TrilinosWrappers::MPI::Vector inverse_squares_multiplier(
-      //     mass_matrix_immersed.m());  // M^{-2}
       TrilinosWrappers::MPI::Vector inverse_squares_multiplier;  // M^{-2}
       inverse_squares_multiplier.reinit(embedded_locally_owned_dofs, mpi_comm);
 
@@ -1251,32 +1250,14 @@ void IBStokesProblem<dim, spacedim>::output_results() {
 }
 
 template <int dim, int spacedim>
-void IBStokesProblem<dim, spacedim>::export_results_to_csv_file() {
-  std::ofstream myfile;
-
-  AssertThrow(!parameters_filename.empty(),
-              ExcMessage("You must set the name of the parameter file."));
-  std::filesystem::path p(parameters_filename);
-  myfile.open(p.stem().string() + ".csv",
-              std::ios::app);  // get the filename and add proper extension
-
-  myfile << results_data.dofs_background << "," << results_data.dofs_immersed
-         << "," << results_data.outer_iterations << "\n";
-
-  myfile.close();
-}
-
-template <int dim, int spacedim>
 void IBStokesProblem<dim, spacedim>::run() {
   AssertThrow(parameters.initialized, ExcNotInitialized());
-  deallog.depth_console(parameters.verbosity_level);
 
   setup_grids_and_dofs();
   setup_coupling();
   assemble_stokes();
   solve();
   output_results();
-  // export_results_to_csv_file();
 }
 }  // namespace IBStokes
 
@@ -1292,6 +1273,7 @@ int main(int argc, char **argv) {
     IBStokesProblem<dim, spacedim>::Parameters parameters;
     IBStokesProblem<dim, spacedim> problem(parameters);
 
+    mpi_initlog(true, parameters.verbosity_level);
     std::string parameter_file;
     if (argc > 1)
       parameter_file = argv[1];
