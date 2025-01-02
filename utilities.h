@@ -3,6 +3,7 @@
 
 #include <deal.II/base/exceptions.h>
 #include <deal.II/base/logstream.h>
+#include <deal.II/base/types.h>
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/lac/dynamic_sparsity_pattern.h>
@@ -11,6 +12,7 @@
 #include <deal.II/lac/trilinos_sparsity_pattern.h>
 #include <deal.II/lac/utilities.h>
 #include <deal.II/lac/vector.h>
+#include <deal.II/lac/vector_operation.h>
 
 #include <type_traits>
 
@@ -775,11 +777,11 @@ void create_preconditioner_for_augmented_block(
 template <int dim, int spacedim, typename MatrixType = SparseMatrix<double>,
           typename VectorType = Vector<typename MatrixType::value_type>,
           typename PreconditionerType = TrilinosWrappers::PreconditionAMG>
-void create_augmented_block(const DoFHandler<dim, spacedim> &velocity_dh,
-                            const MatrixType &C, const MatrixType &Ct,
-                            const VectorType &scaling_vector,
-                            const AffineConstraints<double> &constraints,
-                            const double gamma, MatrixType &augmented_matrix) {
+void create_augmented_block(
+    const DoFHandler<dim, spacedim> &velocity_dh, const MatrixType &C,
+    const MatrixType &Ct, const VectorType &scaling_vector,
+    const AffineConstraints<double> &velocity_constraints, const double gamma,
+    MatrixType &augmented_matrix) {
   Assert(dim <= spacedim, ExcImpossibleInDimSpacedim(dim, spacedim));
 
   if constexpr (std::is_same_v<TrilinosWrappers::SparseMatrix, MatrixType>) {
@@ -791,34 +793,43 @@ void create_augmented_block(const DoFHandler<dim, spacedim> &velocity_dh,
     Ct.mmult(augmented_block, C,
              scaling_vector);  // aug = C^T *scaling_vector*C
 
-    const Epetra_CrsGraph &epetra_graph =
-        augmented_block.trilinos_sparsity_pattern();
+    // const Epetra_CrsGraph &epetra_graph =
+    //     augmented_block.trilinos_sparsity_pattern();
 
     const IndexSet &locally_relevant_dofs =
         DoFTools::extract_locally_relevant_dofs(velocity_dh);
-    DynamicSparsityPattern dsp(locally_relevant_dofs);
+    // DynamicSparsityPattern dsp(locally_relevant_dofs);
+    TrilinosWrappers::SparsityPattern dsp(
+        velocity_dh.locally_owned_dofs(), velocity_dh.locally_owned_dofs(),
+        locally_relevant_dofs, velocity_dh.get_communicator());
 
-    DoFTools::make_sparsity_pattern(velocity_dh, dsp, constraints, false);
-    SparsityTools::distribute_sparsity_pattern(
-        dsp, velocity_dh.locally_owned_dofs(), velocity_dh.get_communicator(),
-        locally_relevant_dofs);
+    DoFTools::make_sparsity_pattern(
+        velocity_dh, dsp, velocity_constraints, false,
+        Utilities::MPI::this_mpi_process(velocity_dh.get_communicator()));
+    dsp.compress();
 
-    const Epetra_CrsMatrix &epetra_matrix = augmented_block.trilinos_matrix();
-    const Epetra_Map &row_map = epetra_matrix.RowMap();
-    for (int i = 0; i < row_map.NumMyElements(); ++i) {
-      const int global_row = row_map.GID(i);
-      int num_entries;
-      int *column_indices;
+    // const Epetra_CrsMatrix &epetra_matrix =
+    // augmented_block.trilinos_matrix(); const Epetra_Map &row_map =
+    // epetra_matrix.RowMap(); for (int i = 0; i < row_map.NumMyElements(); ++i)
+    // {
+    //   const int global_row = row_map.GID(i);
+    //   int num_entries;
+    //   int *column_indices;
 
-      epetra_graph.ExtractMyRowView(i, num_entries, column_indices);
-      for (int j = 0; j < num_entries; ++j) {
-        dsp.add(global_row, column_indices[j]);
-      }
-    }
+    //   epetra_graph.ExtractMyRowView(i, num_entries, column_indices);
+    //   for (int j = 0; j < num_entries; ++j) {
+    //     dsp.add(global_row, column_indices[j]);
+    //   }
+    // }
 
-    augmented_matrix.reinit(velocity_dh.locally_owned_dofs(),
-                            velocity_dh.locally_owned_dofs(), dsp,
-                            velocity_dh.get_communicator());
+    // SparsityTools::distribute_sparsity_pattern(
+    //     dsp, velocity_dh.locally_owned_dofs(),
+    //     velocity_dh.get_communicator(), locally_relevant_dofs);
+    // augmented_matrix.reinit(velocity_dh.locally_owned_dofs(),
+    //                         velocity_dh.locally_owned_dofs(), dsp,
+    //                         velocity_dh.get_communicator());
+    MatrixType velocity_block;
+    velocity_block.reinit(dsp);
 
     const auto &space_fe = velocity_dh.get_fe();
 
@@ -852,30 +863,68 @@ void create_augmented_block(const DoFHandler<dim, spacedim> &velocity_dh,
                      gamma * fe_values[velocities].divergence(i, q_point) *
                          fe_values[velocities].divergence(j, q_point)) *
                     fe_values.JxW(q_point);
-              // cell_matrix(i, j) += fe_values.shape_grad(i, q_point) *
-              //                      fe_values.shape_grad(j, q_point) *
-              //                      fe_values.JxW(q_point);
-              // (fe_values.shape_grad(i, q_point) *
-              //      fe_values.shape_grad(j, q_point) +
-              //  gamma * fe_values[velocities].divergence(i, q_point) *
-              //      fe_values[velocities].divergence(j, q_point)) *
-              // fe_values.JxW(q_point);
             }
           }
 
           cell->get_dof_indices(local_dof_indices);
-          constraints.distribute_local_to_global(cell_matrix, local_dof_indices,
-                                                 augmented_matrix);
+          velocity_constraints.distribute_local_to_global(
+              cell_matrix, local_dof_indices, velocity_block);
         }
 
-      augmented_matrix.compress(VectorOperation::add);
+      velocity_block.compress(VectorOperation::add);
     }
     // MatrixTools::create_laplace_matrix(
     //     velocity_dh, QGauss<spacedim>(2 * space_fe.degree + 1),
-    //     augmented_matrix, static_cast<const Function<spacedim> *>(nullptr),
+    //     velocity_block, static_cast<const Function<spacedim> *>(nullptr),
     //     constraints);
 
-    augmented_matrix.add(gamma, augmented_block);
+    // Step 1: Create a combined sparsity pattern
+    TrilinosWrappers::SparsityPattern combined_sparsity(
+        velocity_block.locally_owned_range_indices(),
+        velocity_block.get_mpi_communicator());
+
+    // Add entries from velocity_block to the combined sparsity pattern
+    for (unsigned int i : velocity_block.locally_owned_range_indices()) {
+      for (auto it = velocity_block.begin(i); it != velocity_block.end(i);
+           ++it) {
+        combined_sparsity.add(i, it->column());
+      }
+    }
+
+    // Add entries from augmented_block to the combined sparsity pattern
+    for (unsigned int i : augmented_block.locally_owned_range_indices()) {
+      for (auto it = augmented_block.begin(i); it != augmented_block.end(i);
+           ++it) {
+        combined_sparsity.add(i, it->column());
+      }
+    }
+
+    combined_sparsity.compress();
+
+    // Step 2: Initialize matrix augmented_matrix with the combined sparsity
+    // pattern
+    augmented_matrix.reinit(combined_sparsity);
+
+    // Step 3: Add entries from matrix velocity_block to augmented_matrix
+    for (unsigned int i : velocity_block.locally_owned_range_indices()) {
+      for (auto it = velocity_block.begin(i); it != velocity_block.end(i);
+           ++it) {
+        augmented_matrix.add(i, it->column(), it->value());
+      }
+    }
+
+    // Step 4: Add entries from matrix augmented_block (multiplied by gamma) to
+    // augmented_matrix
+    for (unsigned int i : augmented_block.locally_owned_range_indices()) {
+      for (auto it = augmented_block.begin(i); it != augmented_block.end(i);
+           ++it) {
+        augmented_matrix.add(i, it->column(), gamma * it->value());
+      }
+    }
+    augmented_matrix.compress(VectorOperation::add);
+
+    // augmented_matrix.add(gamma, augmented_block);
+
   } else {
     // PETSc not supported so far.
     AssertThrow(false, ExcNotImplemented("Matrix type not supported!"));

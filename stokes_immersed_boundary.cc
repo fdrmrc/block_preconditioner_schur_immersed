@@ -1,7 +1,9 @@
+#include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/data_out_base.h>
 #include <deal.II/base/exceptions.h>
 #include <deal.II/base/function.h>
 #include <deal.II/base/logstream.h>
+#include <deal.II/base/mpi.h>
 #include <deal.II/base/parameter_acceptor.h>
 #include <deal.II/base/parsed_function.h>
 #include <deal.II/base/patterns.h>
@@ -43,6 +45,7 @@
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/sparsity_pattern.h>
 #include <deal.II/lac/trilinos_block_sparse_matrix.h>
+#include <deal.II/lac/trilinos_linear_operator.h>
 #include <deal.II/lac/trilinos_parallel_block_vector.h>
 #include <deal.II/lac/trilinos_precondition.h>
 #include <deal.II/lac/trilinos_solver.h>
@@ -229,6 +232,7 @@ class IBStokesProblem {
   TrilinosWrappers::BlockSparseMatrix preconditioner_matrix;
 
   AffineConstraints<double> constraints;
+  AffineConstraints<double> constraints_velocity;
 
   TrilinosWrappers::MPI::BlockVector solution;
   TrilinosWrappers::MPI::BlockVector locally_relevant_solution;
@@ -241,14 +245,14 @@ class IBStokesProblem {
   std::vector<IndexSet> stokes_partitioning;
   std::vector<IndexSet> stokes_relevant_partitioning;
 
-  TimerOutput monitor;
-
   std::string parameters_filename;
 
   IndexSet embedded_locally_owned_dofs;
   IndexSet embedded_locally_relevant_dofs;
 
   MPI_Comm mpi_comm;
+  ConditionalOStream pcout;
+  TimerOutput monitor;
 };
 
 template <int dim, int spacedim>
@@ -293,8 +297,9 @@ IBStokesProblem<dim, spacedim>::IBStokesProblem(const Parameters &parameters)
       body_force_function("Body force", spacedim),
       outer_solver_control("Outer solver control"),
       augmented_lagrangian_control("Augmented Lagrangian control"),
-      monitor(std::cout, TimerOutput::summary, TimerOutput::cpu_and_wall_times),
-      mpi_comm(MPI_COMM_WORLD) {
+      mpi_comm(MPI_COMM_WORLD),
+      pcout(std::cout, (Utilities::MPI::this_mpi_process(mpi_comm) == 0)),
+      monitor(pcout, TimerOutput::summary, TimerOutput::cpu_and_wall_times) {
   embedded_configuration_function.declare_parameters_call_back.connect(
       []() -> void {
         ParameterAcceptor::prm.set("Function constants", "R=.21, Cx=.5,Cy=.5");
@@ -356,27 +361,28 @@ void IBStokesProblem<dim, spacedim>::setup_grids_and_dofs() {
   embedded_grid =
       std::make_unique<parallel::shared::Triangulation<dim, spacedim>>(
           mpi_comm);
-  GridGenerator::hyper_cube(*embedded_grid);
-  embedded_grid->refine_global(parameters.initial_embedded_refinement);
+  GridGenerator::hyper_sphere(*embedded_grid, {.45, .45}, 0.21);
+  embedded_grid->refine_global(parameters.initial_embedded_refinement - 2);
 
   embedded_configuration_fe = std::make_unique<FESystem<dim, spacedim>>(
       FE_Q<dim, spacedim>(
           parameters.embedded_configuration_finite_element_degree) ^
       spacedim);
 
-  embedded_configuration_dh =
-      std::make_unique<DoFHandler<dim, spacedim>>(*embedded_grid);
+  // embedded_configuration_dh =
+  //     std::make_unique<DoFHandler<dim, spacedim>>(*embedded_grid);
 
-  embedded_configuration_dh->distribute_dofs(*embedded_configuration_fe);
-  embedded_configuration.reinit(embedded_configuration_dh->n_dofs());
+  // embedded_configuration_dh->distribute_dofs(*embedded_configuration_fe);
+  // embedded_configuration.reinit(embedded_configuration_dh->n_dofs());
 
-  VectorTools::interpolate(*embedded_configuration_dh,
-                           embedded_configuration_function,
-                           embedded_configuration);
+  // VectorTools::interpolate(*embedded_configuration_dh,
+  //                          embedded_configuration_function,
+  //                          embedded_configuration);
 
-  embedded_mapping =
-      std::make_unique<MappingFEField<dim, spacedim, Vector<double>>>(
-          *embedded_configuration_dh, embedded_configuration);
+  // embedded_mapping =
+  //     std::make_unique<MappingFEField<dim, spacedim, Vector<double>>>(
+  //         *embedded_configuration_dh, embedded_configuration);
+  embedded_mapping = std::make_unique<MappingQ1<dim, spacedim>>();
 
   setup_embedded_dofs();
 
@@ -390,14 +396,24 @@ void IBStokesProblem<dim, spacedim>::setup_grids_and_dofs() {
         *space_grid_tools_cache, support_points);
     const auto &cells = std::get<0>(point_locations);
     for (auto &cell : cells) {
-      if (cell->is_locally_owned()) {
-        cell->set_refine_flag();
-        for (const auto face_no : cell->face_indices())
-          if (!cell->at_boundary(face_no))
-            cell->neighbor(face_no)->set_refine_flag();
-      }
+      // if (cell->is_locally_owned()) {
+      cell->set_refine_flag();
+      for (const auto face_no : cell->face_indices())
+        if (!cell->at_boundary(face_no))
+          cell->neighbor(face_no)->set_refine_flag();
+      // }
     }
     space_grid->execute_coarsening_and_refinement();
+  }
+
+  if (space_grid->n_cells() < 2e6) {  // do not dump grid when mesh is too fine
+    std::ofstream out_refined(
+        "grid-refined_proc" +
+        std::to_string(Utilities::MPI::this_mpi_process(mpi_comm)) + ".vtk");
+    GridOut grid_out_refined;
+    grid_out_refined.write_vtk(*space_grid, out_refined);
+    out_refined.close();
+    std::cout << "Refined Grid written to grid-refined.gnuplot" << std::endl;
   }
 
   const double embedded_space_maximal_diameter =
@@ -405,12 +421,11 @@ void IBStokesProblem<dim, spacedim>::setup_grids_and_dofs() {
   double background_space_minimal_diameter =
       GridTools::minimal_cell_diameter(*space_grid);
 
-  deallog << "Background minimal diameter: "
-          << background_space_minimal_diameter
-          << ", embedded maximal diameter: " << embedded_space_maximal_diameter
-          << ", ratio: "
-          << embedded_space_maximal_diameter / background_space_minimal_diameter
-          << std::endl;
+  pcout << "Background minimal diameter: " << background_space_minimal_diameter
+        << ", embedded maximal diameter: " << embedded_space_maximal_diameter
+        << ", ratio: "
+        << embedded_space_maximal_diameter / background_space_minimal_diameter
+        << std::endl;
 
   AssertThrow(
       embedded_space_maximal_diameter < background_space_minimal_diameter,
@@ -445,8 +460,22 @@ void IBStokesProblem<dim, spacedim>::setup_background_dofs() {
   block_component[spacedim] = 1;
   DoFRenumbering::component_wise(*space_dh, block_component);
 
+  const std::vector<types::global_dof_index> dofs_per_block =
+      DoFTools::count_dofs_per_fe_block(*space_dh, block_component);
+  const types::global_dof_index n_u = dofs_per_block[0];
+  const types::global_dof_index n_p = dofs_per_block[1];
+  pcout << "Number of degrees of freedom: " << space_dh->n_dofs() << " (" << n_u
+        << '+' << n_p << ')' << std::endl;
+
+  const IndexSet &stokes_locally_owned_index_set =
+      space_dh->locally_owned_dofs();
+  const IndexSet stokes_locally_relevant_set =
+      DoFTools::extract_locally_relevant_dofs(*space_dh);
+
   {
     constraints.clear();
+    constraints.reinit(stokes_locally_owned_index_set,
+                       stokes_locally_relevant_set);
 
     const FEValuesExtractors::Vector velocities(0);
     DoFTools::make_hanging_node_constraints(*space_dh, constraints);
@@ -457,17 +486,22 @@ void IBStokesProblem<dim, spacedim>::setup_background_dofs() {
   }
   constraints.close();
 
-  const std::vector<types::global_dof_index> dofs_per_block =
-      DoFTools::count_dofs_per_fe_block(*space_dh, block_component);
-  const types::global_dof_index n_u = dofs_per_block[0];
-  const types::global_dof_index n_p = dofs_per_block[1];
-  deallog << "Number of degrees of freedom: " << space_dh->n_dofs() << " ("
-          << n_u << '+' << n_p << ')' << std::endl;
+  const IndexSet &velocity_locally_owned_index_set =
+      velocity_dh->locally_owned_dofs();
+  const IndexSet velocity_locally_relevant_set =
+      DoFTools::extract_locally_relevant_dofs(*velocity_dh);
+  {
+    constraints_velocity.clear();
+    constraints_velocity.reinit(velocity_locally_owned_index_set,
+                                velocity_locally_relevant_set);
 
-  const IndexSet &stokes_locally_owned_index_set =
-      space_dh->locally_owned_dofs();
-  const IndexSet stokes_locally_relevant_set =
-      DoFTools::extract_locally_relevant_dofs(*space_dh);
+    DoFTools::make_hanging_node_constraints(*velocity_dh, constraints_velocity);
+    for (const unsigned int id : parameters.dirichlet_ids)
+      VectorTools::interpolate_boundary_values(
+          *velocity_dh, id, Functions::ZeroFunction<spacedim>(spacedim),
+          constraints_velocity);
+  }
+  constraints_velocity.close();
 
   stokes_partitioning.push_back(
       stokes_locally_owned_index_set.get_view(0, n_u));
@@ -507,8 +541,8 @@ void IBStokesProblem<dim, spacedim>::setup_background_dofs() {
   // }
 
   {
-    BlockDynamicSparsityPattern preconditioner_dsp(dofs_per_block,
-                                                   dofs_per_block);
+    // BlockDynamicSparsityPattern preconditioner_dsp(dofs_per_block,
+    //                                                dofs_per_block);
 
     Table<2, DoFTools::Coupling> preconditioner_coupling(spacedim + 1,
                                                          spacedim + 1);
@@ -519,9 +553,6 @@ void IBStokesProblem<dim, spacedim>::setup_background_dofs() {
         else
           preconditioner_coupling[c][d] = DoFTools::none;
 
-    // DoFTools::make_sparsity_pattern(*space_dh, preconditioner_coupling,
-    //                                 preconditioner_dsp, constraints, false);
-
     preconditioner_sparsity_pattern.reinit(
         stokes_partitioning, stokes_partitioning, stokes_relevant_partitioning,
         mpi_comm);
@@ -530,26 +561,25 @@ void IBStokesProblem<dim, spacedim>::setup_background_dofs() {
         *space_dh, preconditioner_coupling, preconditioner_sparsity_pattern,
         constraints, false, Utilities::MPI::this_mpi_process(MPI_COMM_WORLD));
     preconditioner_sparsity_pattern.compress();
-
-    // preconditioner_sparsity_pattern.copy_from(preconditioner_dsp);
   }
-
-  stokes_matrix.reinit(sparsity_pattern_stokes);
-  preconditioner_matrix.reinit(preconditioner_sparsity_pattern);
 
   // Initialize matrices
   stokes_matrix.reinit(sparsity_pattern_stokes);
+  preconditioner_matrix.reinit(preconditioner_sparsity_pattern);
 
-  DynamicSparsityPattern mass_dsp(embedded_dh->n_dofs(), embedded_dh->n_dofs());
+  // DynamicSparsityPattern mass_dsp(embedded_dh->n_dofs(),
+  // embedded_dh->n_dofs()); mass_sparsity.copy_from(mass_dsp);
+  TrilinosWrappers::SparsityPattern mass_dsp(embedded_locally_owned_dofs,
+                                             mpi_comm);
   DoFTools::make_sparsity_pattern(*embedded_dh, mass_dsp);
-  mass_sparsity.copy_from(mass_dsp);
-  mass_matrix_immersed.reinit(mass_sparsity);  // M_immersed
+  mass_dsp.compress();
+  mass_matrix_immersed.reinit(mass_dsp);  // M_immersed
 
   // Initialize vectors
   // solution.reinit(dofs_per_block);
   // stokes_rhs.reinit(dofs_per_block);
 
-  solution.reinit(stokes_partitioning, stokes_relevant_partitioning, mpi_comm);
+  solution.reinit(stokes_partitioning, mpi_comm);
   locally_relevant_solution.reinit(stokes_partitioning,
                                    stokes_relevant_partitioning, mpi_comm);
   stokes_rhs.reinit(stokes_partitioning, stokes_relevant_partitioning, mpi_comm,
@@ -582,7 +612,7 @@ void IBStokesProblem<dim, spacedim>::setup_embedded_dofs() {
   embedded_rhs.reinit(embedded_locally_owned_dofs, mpi_comm);
   embedded_value.reinit(embedded_locally_owned_dofs, mpi_comm);
 
-  deallog << "Embedded dofs: " << embedded_dh->n_dofs() << std::endl;
+  pcout << "Embedded dofs: " << embedded_dh->n_dofs() << std::endl;
 }
 
 template <int dim, int spacedim>
@@ -607,7 +637,7 @@ void IBStokesProblem<dim, spacedim>::setup_coupling() {
   dsp.compress();
   coupling_matrix.reinit(dsp);
 
-  std::cout << "Sparsity Ct : done" << std::endl;
+  pcout << "Sparsity Ct : done" << std::endl;
 
   // Do the same, but for the transpose
   // DynamicSparsityPattern dsp_t(embedded_dh->n_dofs(), velocity_dh->n_dofs());
@@ -622,7 +652,7 @@ void IBStokesProblem<dim, spacedim>::setup_coupling() {
   // coupling_matrix_t.reinit(coupling_sparsity_t);
   dsp_t.compress();
   coupling_matrix_t.reinit(dsp_t);
-  std::cout << "Sparsity C : done" << std::endl;
+  pcout << "Sparsity C : done" << std::endl;
 }
 
 template <int dim, int spacedim>
@@ -730,9 +760,9 @@ void IBStokesProblem<dim, spacedim>::assemble_stokes() {
                                              local_dof_indices,
                                              preconditioner_matrix);
     }
-    stokes_matrix.compress(VectorOperation::add);
-    preconditioner_matrix.compress(VectorOperation::add);
   }
+  stokes_matrix.compress(VectorOperation::add);
+  preconditioner_matrix.compress(VectorOperation::add);
 
   {
     TimerOutput::Scope timer_section(monitor, "Assemble coupling system");
@@ -765,21 +795,22 @@ void IBStokesProblem<dim, spacedim>::assemble_stokes() {
     VectorTools::interpolate(*embedded_mapping, *embedded_dh,
                              embedded_value_function, embedded_value);
   }
-  deallog << "A dimensions (" << stokes_matrix.block(0, 0).m() << ","
-          << stokes_matrix.block(0, 0).n() << ")" << std::endl;
-  deallog << "B dimensions (" << stokes_matrix.block(1, 0).m() << ","
-          << stokes_matrix.block(1, 0).n() << ")" << std::endl;
-  deallog << "C dimensions (" << coupling_matrix.n() << ","
-          << coupling_matrix.m() << ")" << std::endl;
+  pcout << "A dimensions (" << stokes_matrix.block(0, 0).m() << ","
+        << stokes_matrix.block(0, 0).n() << ")" << std::endl;
+  pcout << "B dimensions (" << stokes_matrix.block(1, 0).m() << ","
+        << stokes_matrix.block(1, 0).n() << ")" << std::endl;
+  pcout << "C dimensions (" << coupling_matrix.n() << "," << coupling_matrix.m()
+        << ")" << std::endl;
 
 #ifdef DEBUG
-  deallog << "C dimensions (check) (" << coupling_matrix_t.m() << ","
-          << coupling_matrix_t.n() << ")" << std::endl;
+  pcout << "C dimensions (check) (" << coupling_matrix_t.m() << ","
+        << coupling_matrix_t.n() << ")" << std::endl;
 #endif
 }
 
 void output_double_number(double input, const std::string &text) {
-  std::cout << text << input << std::endl;
+  if (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+    std::cout << text << input << std::endl;
 }
 
 template <int dim, int spacedim>
@@ -832,16 +863,16 @@ void IBStokesProblem<dim, spacedim>::solve() {
     auto A_inv_f = A_inv * stokes_rhs.block(0);
     lambda = S_lambda_inv *
              (C * A_inv_f - embedded_rhs - SCB * SBB_inv * B * A_inv_f);
-    deallog << "Computed multiplier" << std::endl;
+    pcout << "Computed multiplier" << std::endl;
 
     auto &p = solution.block(1);
     p = SBB_inv * (B * A_inv_f - SBC * lambda);
     constraints.distribute(solution);
-    deallog << "Computed pressure" << std::endl;
+    pcout << "Computed pressure" << std::endl;
     auto &u = solution.block(0);
     u = A_inv * (stokes_rhs.block(0) - Bt * solution.block(1) - Ct * lambda);
     constraints.distribute(solution);
-    deallog << "Computed velocity" << std::endl;
+    pcout << "Computed velocity" << std::endl;
   } else if (std::strcmp(parameters.solver.c_str(), "IBStokesAL") == 0) {
     // Immersed boundary, with Augmented Lagrangian preconditioner
 
@@ -877,8 +908,8 @@ void IBStokesProblem<dim, spacedim>::solve() {
 
     TrilinosWrappers::SparsityPattern diag_inverse_pressure_sparsity(
         stokes_partitioning[1], mpi_comm);
-    for (unsigned int i = 0; i < stokes_partitioning[1].n_elements(); ++i) {
-      diag_inverse_pressure_sparsity.add(i, i);  // Add diagonal entry only
+    for (auto dof : stokes_partitioning[1]) {
+      diag_inverse_pressure_sparsity.add(dof, dof);  // Add diagonal entry only
     }
     diag_inverse_pressure_sparsity.compress();
     TrilinosWrappers::SparseMatrix diag_inverse_pressure_matrix_trilinos;
@@ -898,6 +929,8 @@ void IBStokesProblem<dim, spacedim>::solve() {
         pressure_diagonal_inv(local_idx) =
             1. / preconditioner_matrix.block(1, 1).diag_element(local_idx);
 
+      pressure_diagonal_inv.compress(VectorOperation::insert);
+
       // diag_inverse_pressure_matrix.reinit(pressure_diagonal_inv);
 
       for (auto row : stokes_partitioning[1]) {
@@ -909,12 +942,15 @@ void IBStokesProblem<dim, spacedim>::solve() {
       Mp_inv = linear_operator<TrilinosWrappers::MPI::Vector,
                                TrilinosWrappers::MPI::Vector>(
           diag_inverse_pressure_matrix_trilinos);
+
+      pcout << "Defined inverse of pressure mass matrix" << std::endl;
     } else {
       Mp_inv_ilu.initialize(preconditioner_matrix.block(1, 1));
       // Mp_inv = linear_operator<TrilinosWrappers::MPI::Vector,
       //                          TrilinosWrappers::MPI::Vector>(
       //     preconditioner_matrix.block(1, 1), Mp_inv_ilu);
       Mp_inv = inverse_operator(Mp, cg_solver, Mp_inv_ilu);
+      pcout << "Defined inverse of pressure mass matrix" << std::endl;
     }
 
     const auto Zero = M * 0.0;
@@ -928,9 +964,8 @@ void IBStokesProblem<dim, spacedim>::solve() {
     TrilinosWrappers::MPI::Vector inverse_squares;
     TrilinosWrappers::SparsityPattern diag_inverse_square_sparsity(
         embedded_locally_owned_dofs, mpi_comm);
-    for (unsigned int i = 0; i < embedded_locally_owned_dofs.n_elements();
-         ++i) {
-      diag_inverse_square_sparsity.add(i, i);  // Add diagonal entry only
+    for (auto dof : embedded_locally_owned_dofs) {
+      diag_inverse_square_sparsity.add(dof, dof);  // Add diagonal entry only
     }
     diag_inverse_square_sparsity.compress();
     TrilinosWrappers::SparseMatrix diag_inverse_square_trilinos;
@@ -964,21 +999,22 @@ void IBStokesProblem<dim, spacedim>::solve() {
 
     const double gamma = augmented_lagrangian_control.gamma;
     const double gamma_grad_div = augmented_lagrangian_control.gamma_grad_div;
-    deallog << "gamma (Grad-div): " << gamma_grad_div << std::endl;
-    deallog << "gamma (AL): " << gamma << std::endl;
+    pcout << "gamma (Grad-div): " << gamma_grad_div << std::endl;
+    pcout << "gamma (AL): " << gamma << std::endl;
     auto Aug = null_operator(A);
 
-    if (augmented_lagrangian_control.grad_div_stabilization)
-      Aug = A + gamma * Ct * invW * C;
-    else
-      Aug = A + gamma * Ct * invW * C + gamma_grad_div * Bt * Mp_inv * B;
+    // pcout << "Before defining" << std::endl;
+    // if (augmented_lagrangian_control.grad_div_stabilization)
+    //   Aug = A + gamma * Ct * invW * C;
+    // else
+    //   Aug = A + gamma * Ct * invW * C + gamma_grad_div * Bt * Mp_inv * B;
+
+    // pcout << "Defined aug temp" << std::endl;
 
     TrilinosWrappers::SparseMatrix augmented_matrix;
     {
       TrilinosWrappers::MPI::Vector inverse_squares_multiplier;  // M^{-2}
-      inverse_squares_multiplier.reinit(embedded_locally_owned_dofs,
-                                        embedded_locally_relevant_dofs,
-                                        mpi_comm);
+      inverse_squares_multiplier.reinit(embedded_locally_owned_dofs, mpi_comm);
 
       // for (types::global_dof_index i = 0; i < mass_matrix_immersed.m(); ++i)
       for (const types::global_dof_index local_idx :
@@ -987,23 +1023,31 @@ void IBStokesProblem<dim, spacedim>::solve() {
             1. / (mass_matrix_immersed.diag_element(local_idx) *
                   mass_matrix_immersed.diag_element(local_idx));
 
+      inverse_squares_multiplier.compress(VectorOperation::insert);
+
+      pcout << "inverse_squares_multiplier: defined" << std::endl;
       UtilitiesAL::create_augmented_block(
           *velocity_dh, coupling_matrix_t, coupling_matrix,
-          inverse_squares_multiplier, constraints, gamma, augmented_matrix);
+          inverse_squares_multiplier, constraints_velocity, gamma,
+          augmented_matrix);
+      pcout << "augmented block: defined" << std::endl;
 
-#ifdef DEBUG
-      TrilinosWrappers::MPI::Vector v, w, w2;
-      v.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      v = 1.;
-      v.compress(VectorOperation::insert);
-      w.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      augmented_matrix.vmult(w, v);
-      w2.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      w2 = Aug * v;
+      // #ifdef DEBUG
+      //       TrilinosWrappers::MPI::Vector v, w, w2;
+      //       v.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
+      //       v = 1.;
+      //       v.compress(VectorOperation::insert);
+      //       w.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
+      //       augmented_matrix.vmult(w, v);
+      //       w2.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
+      //       w2 = Aug * v;
 
-      for (unsigned int i = 0; i < v.locally_owned_size(); ++i)
-        std::cout << w[i] - w2[i] << std::endl;
-#endif
+      //       pcout << "mat vec check: done" << std::endl;
+      //       // for (unsigned int i = 0; i < v.locally_owned_size(); ++i)
+      //       //   std::cout << w[i] - w2[i] << std::endl; USELESS because now
+      //       Aug is
+      //       //   null operator.
+      // #endif
     }
 
     Aug = linear_operator<TrilinosWrappers::MPI::Vector,
@@ -1029,6 +1073,7 @@ void IBStokesProblem<dim, spacedim>::solve() {
                mpi_comm);
     // tmp.reinit(stokes_rhs.block(0).size());
     tmp = gamma * Ct * invW * embedded_rhs;
+    pcout << "Defined tmp for AL" << std::endl;
     system_rhs_block.block(0) = stokes_rhs.block(0);
     system_rhs_block.block(0).add(1., tmp);  // ! augmented
     system_rhs_block.block(1) = stokes_rhs.block(1);
@@ -1049,9 +1094,7 @@ void IBStokesProblem<dim, spacedim>::solve() {
       // TrilinosWrappers::MPI::Vector inverse_squares_multiplier(
       //     mass_matrix_immersed.m());  // M^{-2}
       TrilinosWrappers::MPI::Vector inverse_squares_multiplier;  // M^{-2}
-      inverse_squares_multiplier.reinit(embedded_locally_owned_dofs,
-                                        embedded_locally_relevant_dofs,
-                                        mpi_comm);
+      inverse_squares_multiplier.reinit(embedded_locally_owned_dofs, mpi_comm);
 
       // for (types::global_dof_index i = 0; i < mass_matrix_immersed.m(); ++i)
       for (const types::global_dof_index local_idx :
@@ -1059,6 +1102,10 @@ void IBStokesProblem<dim, spacedim>::solve() {
         inverse_squares_multiplier(local_idx) =
             1. / (mass_matrix_immersed.diag_element(local_idx) *
                   mass_matrix_immersed.diag_element(local_idx));
+
+      inverse_squares_multiplier.compress(VectorOperation::insert);
+
+      pcout << "inverse_squares_multiplier: defined" << std::endl;
 
       // UtilitiesAL::create_preconditioner_for_augmented_block(
       //     *velocity_dh, *space_dh, stokes_matrix.block(0, 0),
@@ -1080,6 +1127,8 @@ void IBStokesProblem<dim, spacedim>::solve() {
 
       prec_amg_aug.initialize(augmented_matrix,
                               amg_data);  //! actually fill the preconditioner
+
+      pcout << "Initialized AMG preconditioner" << std::endl;
 
       Aug_inv = inverse_operator(Aug, solver_lagrangian, prec_amg_aug);
     } else if (augmented_lagrangian_control.AMG_preconditioner_augmented ==
@@ -1153,18 +1202,26 @@ void IBStokesProblem<dim, spacedim>::output_results() {
 
     DataOut<spacedim> data_out_stokes;
     data_out_stokes.attach_dof_handler(*space_dh);
-    data_out_stokes.add_data_vector(solution, solution_names,
+    data_out_stokes.add_data_vector(locally_relevant_solution, solution_names,
                                     DataOut<spacedim>::type_dof_data,
                                     data_component_interpretation);
+
+    Vector<float> subdomain(space_grid->n_active_cells());
+    for (unsigned int i = 0; i < subdomain.size(); ++i)
+      subdomain(i) = space_grid->locally_owned_subdomain();
+    data_out_stokes.add_data_vector(subdomain, "subdomain");
+
     data_out_stokes.build_patches();
 
-    std::ofstream output("solution-stokes.vtk");
-    data_out_stokes.write_vtk(output);
+    // std::ofstream output("solution-stokes.vtk");
+    // data_out_stokes.write_vtk(output);
+    data_out_stokes.write_vtu_with_pvtu_record(
+        "", "solution-stokes", 1, mpi_comm, numbers::invalid_unsigned_int, 0);
   }
 
   // Estimate condition number:
-  deallog << "- - - - - - - - - - - - - - - - - - - - - - - -" << std::endl;
-  deallog << "Estimate condition number of CCt using CG" << std::endl;
+  pcout << "- - - - - - - - - - - - - - - - - - - - - - - -" << std::endl;
+  pcout << "Estimate condition number of CCt using CG" << std::endl;
   SolverControl solver_control(lambda.size(), 1e-12);
   SolverCG<TrilinosWrappers::MPI::Vector> solver_cg(solver_control);
 
@@ -1188,8 +1245,8 @@ void IBStokesProblem<dim, spacedim>::output_results() {
   try {
     solver_cg.solve(CCt, u, f, prec_no);
   } catch (...) {
-    std::cerr << "***CCt solve not successfull (see condition number above)***"
-              << std::endl;
+    pcout << "***CCt solve not successfull (see condition number above)***"
+          << std::endl;
   }
 }
 
@@ -1226,6 +1283,7 @@ void IBStokesProblem<dim, spacedim>::run() {
 int main(int argc, char **argv) {
   try {
     Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
+
     using namespace dealii;
     using namespace IBStokes;
 
