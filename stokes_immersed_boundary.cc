@@ -913,7 +913,6 @@ void IBStokesProblem<dim, spacedim>::solve() {
     SolverCG<TrilinosWrappers::MPI::Vector> cg_solver(solver_control);
 
     if (augmented_lagrangian_control.inverse_diag_square) {
-      const unsigned int n_cols_Mp = preconditioner_matrix.block(1, 1).m();
       TrilinosWrappers::MPI::Vector pressure_diagonal_inv;
       pressure_diagonal_inv.reinit(stokes_partitioning[1], mpi_comm);
       // for (types::global_dof_index i = 0; i < n_cols_Mp; ++i)
@@ -1024,24 +1023,6 @@ void IBStokesProblem<dim, spacedim>::solve() {
           inverse_squares_multiplier, constraints_velocity, gamma,
           augmented_matrix);
       pcout << "augmented block: defined" << std::endl;
-
-#ifdef DEBUG
-      TrilinosWrappers::MPI::Vector v, w, w2;
-      v.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      v = 1.;
-      v.compress(VectorOperation::insert);
-      w.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      augmented_matrix.vmult(w, v);
-      w2.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      w2 = Aug_check * v;
-
-      pcout << "mat vec check: done" << std::endl;
-      for (const types::global_dof_index idx : stokes_partitioning[0]) {
-        std::cout << w[idx] - w2[idx] << std::endl;
-        if (std::fabs(w[idx] - w2[idx]) > 1e-12)
-          std::cout << "hey, mismatch!" << std::endl;
-      }
-#endif
     }
 
     Aug = linear_operator<TrilinosWrappers::MPI::Vector,
@@ -1097,11 +1078,6 @@ void IBStokesProblem<dim, spacedim>::solve() {
       inverse_squares_multiplier.compress(VectorOperation::insert);
 
       pcout << "inverse_squares_multiplier: defined" << std::endl;
-
-      // UtilitiesAL::create_preconditioner_for_augmented_block(
-      //     *velocity_dh, *space_dh, stokes_matrix.block(0, 0),
-      //     coupling_matrix_t, coupling_matrix, inverse_squares_multiplier,
-      //     constraints, gamma, prec_amg_aug);
 
       const FEValuesExtractors::Vector velocity_components(0);
       const std::vector<std::vector<bool>> constant_modes =
