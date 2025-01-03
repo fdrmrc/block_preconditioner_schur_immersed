@@ -1060,9 +1060,11 @@ void IBStokesProblem<dim, spacedim>::solve() {
     SolverCG<TrilinosWrappers::MPI::Vector> solver_lagrangian(
         control_lagrangian);
 
+    // Depending on the parameters file, we will initialize an AMG
+    // preconditioner or not.
     auto Aug_inv = null_operator(A);
-    TrilinosWrappers::PreconditionAMG
-        prec_amg_aug;  // will be initialized only if selected
+    TrilinosWrappers::PreconditionAMG prec_amg_aug;
+    TrilinosWrappers::PreconditionIdentity prec_id;
     if (augmented_lagrangian_control.AMG_preconditioner_augmented == true &&
         augmented_lagrangian_control.grad_div_stabilization == true) {
       TrilinosWrappers::MPI::Vector inverse_squares_multiplier;  // M^{-2}
@@ -1103,7 +1105,6 @@ void IBStokesProblem<dim, spacedim>::solve() {
                    false &&
                augmented_lagrangian_control.grad_div_stabilization == false) {
       // No preconditioner and no grad-div
-      TrilinosWrappers::PreconditionIdentity prec_id;
       Aug_inv = inverse_operator(Aug, solver_lagrangian, prec_id);
     } else {
       AssertThrow(false, ExcNotImplemented());
