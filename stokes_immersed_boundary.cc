@@ -404,16 +404,6 @@ void IBStokesProblem<dim, spacedim>::setup_grids_and_dofs() {
     space_grid->execute_coarsening_and_refinement();
   }
 
-  if (space_grid->n_cells() < 2e6) {  // do not dump grid when mesh is too fine
-    std::ofstream out_refined(
-        "grid-refined_proc" +
-        std::to_string(Utilities::MPI::this_mpi_process(mpi_comm)) + ".vtk");
-    GridOut grid_out_refined;
-    grid_out_refined.write_vtk(*space_grid, out_refined);
-    out_refined.close();
-    std::cout << "Refined Grid written to grid-refined.gnuplot" << std::endl;
-  }
-
   const double embedded_space_maximal_diameter =
       GridTools::maximal_cell_diameter(*embedded_grid, *embedded_mapping);
   double background_space_minimal_diameter =
@@ -919,14 +909,13 @@ void IBStokesProblem<dim, spacedim>::solve() {
     diag_inverse_pressure_matrix_trilinos.reinit(
         diag_inverse_pressure_sparsity);
 
-    SolverControl solver_control(1000, 1e-14, false, true);
+    SolverControl solver_control(1000, 1e-14, false, false);
     SolverCG<TrilinosWrappers::MPI::Vector> cg_solver(solver_control);
 
     if (augmented_lagrangian_control.inverse_diag_square) {
       const unsigned int n_cols_Mp = preconditioner_matrix.block(1, 1).m();
       TrilinosWrappers::MPI::Vector pressure_diagonal_inv;
-      pressure_diagonal_inv.reinit(stokes_partitioning[1],
-                                   stokes_relevant_partitioning[1], mpi_comm);
+      pressure_diagonal_inv.reinit(stokes_partitioning[1], mpi_comm);
       // for (types::global_dof_index i = 0; i < n_cols_Mp; ++i)
       for (const types::global_dof_index local_idx : stokes_partitioning[1])
         pressure_diagonal_inv(local_idx) =
@@ -1005,10 +994,11 @@ void IBStokesProblem<dim, spacedim>::solve() {
     pcout << "gamma (Grad-div): " << gamma_grad_div << std::endl;
     pcout << "gamma (AL): " << gamma << std::endl;
     auto Aug = null_operator(A);
+    auto Aug_check = A + gamma * Ct * invW * C;
 
     // pcout << "Before defining" << std::endl;
     // if (augmented_lagrangian_control.grad_div_stabilization)
-    //   Aug = A + gamma * Ct * invW * C;
+    Aug = A + gamma * Ct * invW * C;
     // else
     //   Aug = A + gamma * Ct * invW * C + gamma_grad_div * Bt * Mp_inv * B;
 
@@ -1035,26 +1025,28 @@ void IBStokesProblem<dim, spacedim>::solve() {
           augmented_matrix);
       pcout << "augmented block: defined" << std::endl;
 
-      // #ifdef DEBUG
-      //       TrilinosWrappers::MPI::Vector v, w, w2;
-      //       v.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      //       v = 1.;
-      //       v.compress(VectorOperation::insert);
-      //       w.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      //       augmented_matrix.vmult(w, v);
-      //       w2.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
-      //       w2 = Aug * v;
+#ifdef DEBUG
+      TrilinosWrappers::MPI::Vector v, w, w2;
+      v.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
+      v = 1.;
+      v.compress(VectorOperation::insert);
+      w.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
+      augmented_matrix.vmult(w, v);
+      w2.reinit(velocity_dh->locally_owned_dofs(), mpi_comm);
+      w2 = Aug_check * v;
 
-      //       pcout << "mat vec check: done" << std::endl;
-      //       // for (unsigned int i = 0; i < v.locally_owned_size(); ++i)
-      //       //   std::cout << w[i] - w2[i] << std::endl; USELESS because now
-      //       Aug is
-      //       //   null operator.
-      // #endif
+      pcout << "mat vec check: done" << std::endl;
+      for (const types::global_dof_index idx : stokes_partitioning[0]) {
+        std::cout << w[idx] - w2[idx] << std::endl;
+        if (std::fabs(w[idx] - w2[idx]) > 1e-12)
+          std::cout << "hey, mismatch!" << std::endl;
+      }
+#endif
     }
 
     Aug = linear_operator<TrilinosWrappers::MPI::Vector,
-                          TrilinosWrappers::MPI::Vector>(augmented_matrix);
+                          TrilinosWrappers::MPI::Vector, PayloadType>(
+        augmented_matrix);
 
     auto AA = block_operator<3, 3, TrilinosWrappers::MPI::BlockVector>(
         {{{{Aug, Bt, Ct}},
@@ -1124,6 +1116,7 @@ void IBStokesProblem<dim, spacedim>::solve() {
       amg_data.smoother_sweeps = 2;
       amg_data.aggregation_threshold = 0.02;
 
+      pcout << "Initializing AMG preconditioner..." << std::endl;
       prec_amg_aug.initialize(augmented_matrix,
                               amg_data);  //! actually fill the preconditioner
 

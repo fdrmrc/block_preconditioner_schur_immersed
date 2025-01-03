@@ -10,6 +10,7 @@
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/sparsity_pattern.h>
 #include <deal.II/lac/trilinos_sparsity_pattern.h>
+#include <deal.II/lac/trilinos_vector.h>
 #include <deal.II/lac/utilities.h>
 #include <deal.II/lac/vector.h>
 #include <deal.II/lac/vector_operation.h>
@@ -17,7 +18,11 @@
 #include <type_traits>
 
 #ifdef DEAL_II_WITH_TRILINOS
+#include <EpetraExt_MatrixMatrix.h>
+#include <EpetraExt_Transpose_RowMatrix.h>
+#include <Epetra_Comm.h>
 #include <Epetra_CrsMatrix.h>
+#include <Epetra_Map.h>
 #include <Epetra_RowMatrixTransposer.h>
 #include <deal.II/lac/trilinos_precondition.h>
 #include <deal.II/lac/trilinos_sparse_matrix.h>
@@ -810,10 +815,15 @@ void create_augmented_block(
     Assert((std::is_same_v<TrilinosWrappers::MPI::Vector, VectorType>),
            ExcMessage("You must use Trilinos vectors, as you are using "
                       "Trilinos matrices."));
-    MatrixType augmented_block;
+
+    // MatrixType augmented_block;
+
     //  The sparsity of augmented_block will be changed by mmult
-    Ct.mmult(augmented_block, C,
-             scaling_vector);  // aug = C^T *scaling_vector*C
+    // Ct.mmult(augmented_block, C,
+    //          scaling_vector);  // aug = C^T *scaling_vector*C
+
+    // if (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD) == 0)
+    //   std::cout << "Performed CCt" << std::endl;
 
     // const Epetra_CrsGraph &epetra_graph =
     //     augmented_block.trilinos_sparsity_pattern();
@@ -821,6 +831,14 @@ void create_augmented_block(
     const IndexSet &locally_relevant_dofs =
         DoFTools::extract_locally_relevant_dofs(velocity_dh);
     // DynamicSparsityPattern dsp(locally_relevant_dofs);
+    // DoFTools::make_sparsity_pattern(velocity_dh, dsp, velocity_constraints,
+    //                                 false);
+    // SparsityTools::distribute_sparsity_pattern(
+    //     dsp, velocity_dh.locally_owned_dofs(),
+    //     velocity_dh.get_communicator(), locally_relevant_dofs);
+    // TrilinosWrappers::SparsityPattern dsp(
+    //     velocity_dh.locally_owned_dofs(), velocity_dh.locally_owned_dofs(),
+    //     locally_relevant_dofs, velocity_dh.get_communicator());
     TrilinosWrappers::SparsityPattern dsp(
         velocity_dh.locally_owned_dofs(), velocity_dh.locally_owned_dofs(),
         locally_relevant_dofs, velocity_dh.get_communicator());
@@ -829,6 +847,11 @@ void create_augmented_block(
         velocity_dh, dsp, velocity_constraints, false,
         Utilities::MPI::this_mpi_process(velocity_dh.get_communicator()));
     dsp.compress();
+
+    // DoFTools::make_sparsity_pattern(
+    //     velocity_dh, dsp, velocity_constraints, false,
+    //     Utilities::MPI::this_mpi_process(velocity_dh.get_communicator()));
+    // dsp.compress();
 
     // const Epetra_CrsMatrix &epetra_matrix =
     // augmented_block.trilinos_matrix(); const Epetra_Map &row_map =
@@ -843,15 +866,17 @@ void create_augmented_block(
     //     dsp.add(global_row, column_indices[j]);
     //   }
     // }
-
-    // SparsityTools::distribute_sparsity_pattern(
-    //     dsp, velocity_dh.locally_owned_dofs(),
-    //     velocity_dh.get_communicator(), locally_relevant_dofs);
+    // augmented_matrix.reinit(velocity_dh.locally_owned_dofs(),
+    //                         velocity_dh.locally_owned_dofs(), dsp,
+    //                         velocity_dh.get_communicator());
     // augmented_matrix.reinit(velocity_dh.locally_owned_dofs(),
     //                         velocity_dh.locally_owned_dofs(), dsp,
     //                         velocity_dh.get_communicator());
     MatrixType velocity_block;
     velocity_block.reinit(dsp);
+    // augmented_block *= gamma;
+    // augmented_matrix.reinit(augmented_block);
+    // augmented_matrix.copy_from(augmented_block);
 
     const auto &space_fe = velocity_dh.get_fe();
 
@@ -895,57 +920,107 @@ void create_augmented_block(
 
       velocity_block.compress(VectorOperation::add);
     }
-    // MatrixTools::create_laplace_matrix(
-    //     velocity_dh, QGauss<spacedim>(2 * space_fe.degree + 1),
-    //     velocity_block, static_cast<const Function<spacedim> *>(nullptr),
-    //     constraints);
 
-    // Step 1: Create a combined sparsity pattern
-    TrilinosWrappers::SparsityPattern combined_sparsity(
-        velocity_block.locally_owned_range_indices(),
-        velocity_block.get_mpi_communicator());
+    Epetra_CrsMatrix A_trilinos = velocity_block.trilinos_matrix();
+    Epetra_CrsMatrix C_trilinos = C.trilinos_matrix();
+    auto v = scaling_vector.trilinos_vector();
 
-    // Add entries from velocity_block to the combined sparsity pattern
-    for (unsigned int i : velocity_block.locally_owned_range_indices()) {
-      for (auto it = velocity_block.begin(i); it != velocity_block.end(i);
-           ++it) {
-        combined_sparsity.add(i, it->column());
+    // Verify matrix compatibility
+    if (A_trilinos.NumGlobalRows() != A_trilinos.NumGlobalCols()) {
+      throw std::runtime_error("Matrix A must be square");
+    }
+    if (A_trilinos.NumGlobalRows() != C_trilinos.NumGlobalCols()) {
+      throw std::runtime_error(
+          "Number of rows in A must match number of rows in C");
+    }
+    // if (v.NumGlobalElements() != C_trilinos.NumGlobalRows()) {
+    //   throw std::runtime_error(
+    //       "Vector dimension must match number of rows in C");
+    // }
+
+    // Get number of vectors in MultiVector
+    int numVectors = v.NumVectors();
+    std::vector<Epetra_CrsMatrix *> results(numVectors);
+
+    std::cout << "numVectors = " << numVectors << std::endl;
+
+    // Create C transpose
+    Epetra_CrsMatrix *C_trans = new Epetra_CrsMatrix(
+        Copy, C_trilinos.DomainMap(), C_trilinos.RangeMap(), 0);
+    EpetraExt::RowMatrix_Transpose trans;
+    C_trans = &(dynamic_cast<Epetra_CrsMatrix &>(trans(C_trilinos)));
+    std::cout << "Here ok" << std::endl;
+
+    // Array to store pointers to each vector's data
+    double **vec_values;
+    v.ExtractView(&vec_values);
+
+    const Epetra_Map &rowMap = C_trilinos.RowMap();
+
+    // Process each vector separately
+    for (int vec_idx = 0; vec_idx < numVectors; ++vec_idx) {
+      // Create diagonal matrix V from the current vector
+      // V has same dimensions as original matrix (m x m)
+      Epetra_CrsMatrix *V_diag = new Epetra_CrsMatrix(Copy, rowMap, 1);
+
+      // Fill the diagonal matrix
+      for (int i = 0; i < v.MyLength(); ++i) {
+        int global_row = v.Map().GID(i);
+        double val = vec_values[vec_idx][i];
+        V_diag->InsertGlobalValues(global_row, 1, &val, &global_row);
       }
+      V_diag->FillComplete();
+
+      // Create temporary matrices
+      // temp1 will be n x m (C^T is n x m, V is m x m)
+      Epetra_CrsMatrix *temp1 =
+          new Epetra_CrsMatrix(Copy, C_trans->RowMap(), V_diag->RangeMap(), 0);
+      // temp2 will be n x n (temp1 is n x m, C is m x n)
+      Epetra_CrsMatrix *temp2 = new Epetra_CrsMatrix(
+          Copy, C_trilinos.DomainMap(), C_trilinos.DomainMap(), 0);
+      // temp3 will be m x n (C is m x n)
+      Epetra_CrsMatrix *temp3 = new Epetra_CrsMatrix(Copy, C_trilinos.RowMap(),
+                                                     C_trilinos.DomainMap(), 0);
+
+      // Compute steps:
+      // 1. C^T * V (n x m)
+      EpetraExt::MatrixMatrix::Multiply(*C_trans, false, *V_diag, false,
+                                        *temp1);
+      temp1->FillComplete(V_diag->RangeMap(), C_trans->RowMap());
+
+      // 2. (C^T * V) * C (n x n)
+      EpetraExt::MatrixMatrix::Multiply(*temp1, false, C_trilinos, false,
+                                        *temp2);
+      temp2->FillComplete();
+
+      // 3. Scale by gamma
+      temp2->Scale(gamma);
+
+      // 4. C * (gamma * C^T * V * C) (m x n)
+      // EpetraExt::MatrixMatrix::Multiply(C_trilinos, false, *temp2, false,
+      //                                   *temp3);
+      // temp3->FillComplete();
+
+      // Create and fill result matrix
+      results[vec_idx] = new Epetra_CrsMatrix(Copy, A_trilinos.RowMap(),
+                                              A_trilinos.ColMap(), 0);
+      EpetraExt::MatrixMatrix::Add(A_trilinos, false, 1.0, *temp2, false, 1.0,
+                                   results[vec_idx]);
+      results[vec_idx]->FillComplete();
+
+      std::cout << "Before switch to TrilinosWrappers" << std::endl;
+      augmented_matrix.reinit(*results[vec_idx], true);
+      std::cout << "After switch to TrilinosWrappers" << std::endl;
+
+      // Clean up temporary matrices
+      // delete C_trans;
+      delete V_diag;
+      delete temp1;
+      delete temp2;
+      delete temp3;
     }
 
-    // Add entries from augmented_block to the combined sparsity pattern
-    for (unsigned int i : augmented_block.locally_owned_range_indices()) {
-      for (auto it = augmented_block.begin(i); it != augmented_block.end(i);
-           ++it) {
-        combined_sparsity.add(i, it->column());
-      }
-    }
-
-    combined_sparsity.compress();
-
-    // Step 2: Initialize matrix augmented_matrix with the combined sparsity
-    // pattern
-    augmented_matrix.reinit(combined_sparsity);
-
-    // Step 3: Add entries from matrix velocity_block to augmented_matrix
-    for (unsigned int i : velocity_block.locally_owned_range_indices()) {
-      for (auto it = velocity_block.begin(i); it != velocity_block.end(i);
-           ++it) {
-        augmented_matrix.add(i, it->column(), it->value());
-      }
-    }
-
-    // Step 4: Add entries from matrix augmented_block (multiplied by gamma) to
-    // augmented_matrix
-    for (unsigned int i : augmented_block.locally_owned_range_indices()) {
-      for (auto it = augmented_block.begin(i); it != augmented_block.end(i);
-           ++it) {
-        augmented_matrix.add(i, it->column(), gamma * it->value());
-      }
-    }
-    augmented_matrix.compress(VectorOperation::add);
-
-    // augmented_matrix.add(gamma, augmented_block);
+    std::cout << "Done" << std::endl;
 
   } else {
     // PETSc not supported so far.
