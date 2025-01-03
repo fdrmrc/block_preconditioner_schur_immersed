@@ -923,47 +923,30 @@ void create_augmented_block(
 
     Epetra_CrsMatrix A_trilinos = velocity_block.trilinos_matrix();
     Epetra_CrsMatrix C_trilinos = C.trilinos_matrix();
+    Epetra_CrsMatrix Ct_trilinos = Ct.trilinos_matrix();
     auto v = scaling_vector.trilinos_vector();
 
-    // Verify matrix compatibility
-    if (A_trilinos.NumGlobalRows() != A_trilinos.NumGlobalCols()) {
-      throw std::runtime_error("Matrix A must be square");
-    }
-    if (A_trilinos.NumGlobalRows() != C_trilinos.NumGlobalCols()) {
+    if (A_trilinos.NumGlobalRows() !=
+        C_trilinos.DomainMap().NumGlobalElements()) {
       throw std::runtime_error(
-          "Number of rows in A must match number of rows in C");
+          "Number of columns in C must match dimension of A");
     }
     // if (v.NumGlobalElements() != C_trilinos.NumGlobalRows()) {
     //   throw std::runtime_error(
     //       "Vector dimension must match number of rows in C");
     // }
 
-    // Get number of vectors in MultiVector
     int numVectors = v.NumVectors();
     std::vector<Epetra_CrsMatrix *> results(numVectors);
 
-    std::cout << "numVectors = " << numVectors << std::endl;
-
-    // Create C transpose
-    Epetra_CrsMatrix *C_trans = new Epetra_CrsMatrix(
-        Copy, C_trilinos.DomainMap(), C_trilinos.RangeMap(), 0);
-    EpetraExt::RowMatrix_Transpose trans;
-    C_trans = &(dynamic_cast<Epetra_CrsMatrix &>(trans(C_trilinos)));
-    std::cout << "Here ok" << std::endl;
-
-    // Array to store pointers to each vector's data
     double **vec_values;
     v.ExtractView(&vec_values);
 
     const Epetra_Map &rowMap = C_trilinos.RowMap();
 
-    // Process each vector separately
     for (int vec_idx = 0; vec_idx < numVectors; ++vec_idx) {
-      // Create diagonal matrix V from the current vector
-      // V has same dimensions as original matrix (m x m)
       Epetra_CrsMatrix *V_diag = new Epetra_CrsMatrix(Copy, rowMap, 1);
 
-      // Fill the diagonal matrix
       for (int i = 0; i < v.MyLength(); ++i) {
         int global_row = v.Map().GID(i);
         double val = vec_values[vec_idx][i];
@@ -971,37 +954,27 @@ void create_augmented_block(
       }
       V_diag->FillComplete();
 
-      // Create temporary matrices
       // temp1 will be n x m (C^T is n x m, V is m x m)
-      Epetra_CrsMatrix *temp1 =
-          new Epetra_CrsMatrix(Copy, C_trans->RowMap(), V_diag->RangeMap(), 0);
-      // temp2 will be n x n (temp1 is n x m, C is m x n)
-      Epetra_CrsMatrix *temp2 = new Epetra_CrsMatrix(
-          Copy, C_trilinos.DomainMap(), C_trilinos.DomainMap(), 0);
-      // temp3 will be m x n (C is m x n)
-      Epetra_CrsMatrix *temp3 = new Epetra_CrsMatrix(Copy, C_trilinos.RowMap(),
-                                                     C_trilinos.DomainMap(), 0);
+      Epetra_CrsMatrix *temp1 = new Epetra_CrsMatrix(Copy, Ct_trilinos.RowMap(),
+                                                     V_diag->RangeMap(), 0);
+      // temp2 will be n x n (matches A's dimensions)
+      Epetra_CrsMatrix *temp2 = new Epetra_CrsMatrix(Copy, A_trilinos.RowMap(),
+                                                     A_trilinos.ColMap(), 0);
 
-      // Compute steps:
-      // 1. C^T * V (n x m)
-      EpetraExt::MatrixMatrix::Multiply(*C_trans, false, *V_diag, false,
+      // Compute C^T * V
+      EpetraExt::MatrixMatrix::Multiply(Ct_trilinos, false, *V_diag, false,
                                         *temp1);
-      temp1->FillComplete(V_diag->RangeMap(), C_trans->RowMap());
+      temp1->FillComplete();
 
-      // 2. (C^T * V) * C (n x n)
+      // Compute (C^T * V) * C
       EpetraExt::MatrixMatrix::Multiply(*temp1, false, C_trilinos, false,
                                         *temp2);
       temp2->FillComplete();
 
-      // 3. Scale by gamma
+      // Scale by gamma
       temp2->Scale(gamma);
 
-      // 4. C * (gamma * C^T * V * C) (m x n)
-      // EpetraExt::MatrixMatrix::Multiply(C_trilinos, false, *temp2, false,
-      //                                   *temp3);
-      // temp3->FillComplete();
-
-      // Create and fill result matrix
+      // Create result and add matrices
       results[vec_idx] = new Epetra_CrsMatrix(Copy, A_trilinos.RowMap(),
                                               A_trilinos.ColMap(), 0);
       EpetraExt::MatrixMatrix::Add(A_trilinos, false, 1.0, *temp2, false, 1.0,
@@ -1012,13 +985,109 @@ void create_augmented_block(
       augmented_matrix.reinit(*results[vec_idx], true);
       std::cout << "After switch to TrilinosWrappers" << std::endl;
 
-      // Clean up temporary matrices
-      // delete C_trans;
       delete V_diag;
       delete temp1;
       delete temp2;
-      delete temp3;
     }
+
+    // // Verify matrix compatibility
+    // if (A_trilinos.NumGlobalRows() != A_trilinos.NumGlobalCols()) {
+    //   throw std::runtime_error("Matrix A must be square");
+    // }
+    // if (A_trilinos.NumGlobalRows() != C_trilinos.NumGlobalCols()) {
+    //   throw std::runtime_error(
+    //       "Number of rows in A must match number of rows in C");
+    // }
+    // // if (v.NumGlobalElements() != C_trilinos.NumGlobalRows()) {
+    // //   throw std::runtime_error(
+    // //       "Vector dimension must match number of rows in C");
+    // // }
+
+    // // Get number of vectors in MultiVector
+    // int numVectors = v.NumVectors();
+    // std::vector<Epetra_CrsMatrix *> results(numVectors);
+
+    // std::cout << "numVectors = " << numVectors << std::endl;
+
+    // // Create C transpose
+    // Epetra_CrsMatrix *C_trans = new Epetra_CrsMatrix(
+    //     Copy, C_trilinos.DomainMap(), C_trilinos.RangeMap(), 0);
+    // EpetraExt::RowMatrix_Transpose trans;
+    // C_trans = &(dynamic_cast<Epetra_CrsMatrix &>(trans(C_trilinos)));
+    // std::cout << "Here ok" << std::endl;
+
+    // // Array to store pointers to each vector's data
+    // double **vec_values;
+    // v.ExtractView(&vec_values);
+
+    // const Epetra_Map &rowMap = C_trilinos.RowMap();
+
+    // // Process each vector separately
+    // for (int vec_idx = 0; vec_idx < numVectors; ++vec_idx) {
+    //   // Create diagonal matrix V from the current vector
+    //   // V has same dimensions as original matrix (m x m)
+    //   Epetra_CrsMatrix *V_diag = new Epetra_CrsMatrix(Copy, rowMap, 1);
+
+    //   // Fill the diagonal matrix
+    //   for (int i = 0; i < v.MyLength(); ++i) {
+    //     int global_row = v.Map().GID(i);
+    //     double val = vec_values[vec_idx][i];
+    //     V_diag->InsertGlobalValues(global_row, 1, &val, &global_row);
+    //   }
+    //   V_diag->FillComplete();
+
+    //   // Create temporary matrices
+    //   // temp1 will be n x m (C^T is n x m, V is m x m)
+    //   Epetra_CrsMatrix *temp1 =
+    //       new Epetra_CrsMatrix(Copy, C_trans->RowMap(), V_diag->RangeMap(),
+    //       0);
+    //   // temp2 will be n x n (temp1 is n x m, C is m x n)
+    //   Epetra_CrsMatrix *temp2 = new Epetra_CrsMatrix(
+    //       Copy, C_trilinos.DomainMap(), C_trilinos.DomainMap(), 0);
+    //   // temp3 will be m x n (C is m x n)
+    //   Epetra_CrsMatrix *temp3 = new Epetra_CrsMatrix(Copy,
+    //   C_trilinos.RowMap(),
+    //                                                  C_trilinos.DomainMap(),
+    //                                                  0);
+
+    //   // Compute steps:
+    //   // 1. C^T * V (n x m)
+    //   EpetraExt::MatrixMatrix::Multiply(*C_trans, false, *V_diag, false,
+    //                                     *temp1);
+    //   temp1->FillComplete(V_diag->RangeMap(), C_trans->RowMap());
+
+    //   // 2. (C^T * V) * C (n x n)
+    //   EpetraExt::MatrixMatrix::Multiply(*temp1, false, C_trilinos, false,
+    //                                     *temp2);
+    //   temp2->FillComplete();
+
+    //   // 3. Scale by gamma
+    //   temp2->Scale(gamma);
+
+    //   // 4. C * (gamma * C^T * V * C) (m x n)
+    //   // EpetraExt::MatrixMatrix::Multiply(C_trilinos, false, *temp2, false,
+    //   //                                   *temp3);
+    //   // temp3->FillComplete();
+
+    //   // Create and fill result matrix
+    //   results[vec_idx] = new Epetra_CrsMatrix(Copy, A_trilinos.RowMap(),
+    //                                           A_trilinos.ColMap(), 0);
+    //   EpetraExt::MatrixMatrix::Add(A_trilinos, false, 1.0, *temp2,
+    //   false, 1.0,
+    //                                results[vec_idx]);
+    //   results[vec_idx]->FillComplete();
+
+    //   std::cout << "Before switch to TrilinosWrappers" << std::endl;
+    //   augmented_matrix.reinit(*results[vec_idx], true);
+    //   std::cout << "After switch to TrilinosWrappers" << std::endl;
+
+    //   // Clean up temporary matrices
+    //   // delete C_trans;
+    //   delete V_diag;
+    //   delete temp1;
+    //   delete temp2;
+    //   delete temp3;
+    // }
 
     std::cout << "Done" << std::endl;
 
