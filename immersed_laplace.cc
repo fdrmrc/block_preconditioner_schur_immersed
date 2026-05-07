@@ -153,7 +153,7 @@ private:
   ParameterAcceptorProxy<Functions::ParsedFunction<spacedim>>
       embedding_dirichlet_boundary_function;
 
-  ParameterAcceptorProxy<ReductionControl> schur_solver_control;
+  ParameterAcceptorProxy<ReductionControl> outer_solver_control;
 
   SparsityPattern stiffness_sparsity;
   SparsityPattern stiffness_sparsity_copy;
@@ -241,7 +241,7 @@ DistributedLagrangeProblem<dim, spacedim>::DistributedLagrangeProblem(
       embedded_value_function("Embedded value"),
       embedding_dirichlet_boundary_function(
           "Embedding Dirichlet boundary conditions"),
-      schur_solver_control("Schur solver control"),
+      outer_solver_control("Schur solver control"),
       monitor(std::cout, TimerOutput::summary,
               TimerOutput::cpu_and_wall_times) {
   embedded_configuration_function.declare_parameters_call_back.connect(
@@ -261,10 +261,12 @@ DistributedLagrangeProblem<dim, spacedim>::DistributedLagrangeProblem(
   embedding_dirichlet_boundary_function.declare_parameters_call_back.connect(
       []() -> void { ParameterAcceptor::prm.set("Function expression", "0"); });
 
-  schur_solver_control.declare_parameters_call_back.connect([]() -> void {
+  outer_solver_control.declare_parameters_call_back.connect([]() -> void {
     ParameterAcceptor::prm.set("Max steps", "1000");
-    ParameterAcceptor::prm.set("Reduction", "1.e-12");
-    ParameterAcceptor::prm.set("Tolerance", "1.e-12");
+    ParameterAcceptor::prm.set("Tolerance", "1.e-9");
+    ParameterAcceptor::prm.set("Reduction", "1e-12");
+    ParameterAcceptor::prm.set("Log history", "true");
+    ParameterAcceptor::prm.set("Log result", "true");
   });
 }
 
@@ -515,7 +517,7 @@ void DistributedLagrangeProblem<dim, spacedim>::solve() {
     auto K_inv = linear_operator(K, K_inv_umfpack);
 
     auto S = C * K_inv * Ct;
-    SolverCG<Vector<double>> solver_cg(schur_solver_control);
+    SolverCG<Vector<double>> solver_cg(outer_solver_control);
     auto S_inv = inverse_operator(S, solver_cg, PreconditionIdentity());
 
     lambda = S_inv * (C * K_inv * embedding_rhs - embedded_rhs);
@@ -575,7 +577,7 @@ void DistributedLagrangeProblem<dim, spacedim>::solve() {
     data.force_re_orthogonalization = true;
     data.right_preconditioning = true;
 
-    SolverGMRES<BlockVector<double>> solver_gmres(schur_solver_control, data);
+    SolverGMRES<BlockVector<double>> solver_gmres(outer_solver_control, data);
 
     solver_gmres.solve(AA, solution_block, system_rhs_block, prec_elman);
 
@@ -625,8 +627,8 @@ void DistributedLagrangeProblem<dim, spacedim>::solve() {
     RationalPreconditioner rational_prec{K_inv, &embedded_stiffness_matrix,
                                          &mass_matrix, rho_bound};
 
-    // SolverGMRES<BlockVector<double>> solver_min_res(schur_solver_control);
-    SolverMinRes<BlockVector<double>> solver_min_res(schur_solver_control);
+    // SolverGMRES<BlockVector<double>> solver_min_res(outer_solver_control);
+    SolverMinRes<BlockVector<double>> solver_min_res(outer_solver_control);
 
     solver_min_res.solve(AA, solution_block, system_rhs_block, rational_prec);
 
@@ -850,19 +852,28 @@ void DistributedLagrangeProblem<dim, spacedim>::solve() {
     // auto invW = invW1 * invW1;
     auto invW = null_operator(M);
     auto invM = null_operator(M);
+
+    // Inner iterative solver for the (SPD) mass matrix: CG preconditioned
+    // with SSOR. This is a classical, well-established choice for SPD
+    // matrices and produces a symmetric application of M^{-1}.
+    static SolverControl mass_inner_control(
+        std::max<unsigned int>(1000, mass_matrix.m()), 1e-9, false, true);
+    static SolverCG<Vector<double>> mass_inner_cg(mass_inner_control);
+    static PreconditionSSOR<SparseMatrix<double>> mass_ssor;
+    mass_ssor.initialize(
+        mass_matrix,
+        PreconditionSSOR<SparseMatrix<double>>::AdditionalData(1.2));
+
+    auto invM_iter = inverse_operator(M, mass_inner_cg, mass_ssor);
+
+    DiagonalMatrix<Vector<double>> diag_matrix;
     Vector<double> inv_diagonal(mass_matrix.m());
-    DiagonalMatrix<Vector<double>> diag_matrix(inv_diagonal);
+
     if (parameters.use_operator_form) {
-
-      if (parameters.use_diagonal_inverse) {
-        for (unsigned int i = 0; i < mass_matrix.m(); ++i)
-          inv_diagonal[i] = 1. / (mass_matrix.diag_element(i));
-
-        diag_matrix.reinit(inv_diagonal);
-        invW = linear_operator(diag_matrix);
-      } else {
+      if (parameters.use_diagonal_inverse)
+        invW = invM_iter;
+      else
         invW = linear_operator(mass_matrix, M_inv_umfpack);
-      }
     } else {
       // no operator form, we use M^2
       if (parameters.use_diagonal_inverse) {
@@ -914,7 +925,7 @@ void DistributedLagrangeProblem<dim, spacedim>::solve() {
     auto Aug_inv = inverse_operator(Aug, solver_lagrangian,
                                     PreconditionIdentity()); //! augmented
 #endif
-    SolverFGMRES<BlockVector<double>> solver_fgmres(schur_solver_control);
+    SolverFGMRES<BlockVector<double>> solver_fgmres(outer_solver_control);
 
     BlockPreconditionerAugmentedLagrangian augmented_lagrangian_preconditioner{
         Aug_inv, C, Ct, invW, gamma};
@@ -953,7 +964,7 @@ void DistributedLagrangeProblem<dim, spacedim>::solve() {
   // Store iteration counts and DoF
   results_data.dofs_background = space_dh->n_dofs();
   results_data.dofs_immersed = embedded_dh->n_dofs();
-  results_data.outer_iterations = schur_solver_control.last_step();
+  results_data.outer_iterations = outer_solver_control.last_step();
 }
 
 template <int dim, int spacedim>
