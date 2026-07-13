@@ -752,6 +752,15 @@ template <int dim> unsigned int EllipticInterfaceDLM<dim>::solve() {
     gamma_2 = parameters.gamma_AL_immersed;
   }
 
+  // Snapshot of the un-augmented background stiffness, so we can dump it
+  // alongside the operator-form augmented A11 below. The matrix is modified
+  // in place by the particle assembly when use_operator_form == true.
+  SparseMatrix<Number> stiffness_matrix_bg_unaug;
+  if (parameters.export_matrices_for_eig_analysis) {
+    stiffness_matrix_bg_unaug.reinit(stiffness_sparsity_bg);
+    stiffness_matrix_bg_unaug.copy_from(stiffness_matrix_bg);
+  }
+
   // Define augmented blocks
   auto A11_aug = null_operator(A_omega1);
   if (parameters.use_operator_form) {
@@ -851,11 +860,40 @@ template <int dim> unsigned int EllipticInterfaceDLM<dim>::solve() {
   std::cout << "Initialized AMG for A_2" << std::endl;
 
   if (parameters.export_matrices_for_eig_analysis) {
-    std::cout << "Exporting matrices to .csv for eigenvalues analysis...";
-    export_to_matlab_csv(stiffness_matrix_bg, "A_DLFDM.csv");
-    export_to_matlab_csv(stiffness_matrix_fg, "A_2_DLFDM.csv");
-    export_to_matlab_csv(coupling_matrix, "Ct_DLFDM.csv");
-    export_to_matlab_csv(mass_matrix_fg, "M_DLFDM.csv");
+    // Dump the matrices that define the (1,1)-block augmentation in MATLAB
+    // triplet (1-based i, j, value) text format. A trailing sentinel row
+    // "n_rows n_cols 0" pins the shape for spconvert / scipy.coo_matrix in case
+    // the last row/column is structurally empty.
+    static unsigned int export_counter = 0;
+    const unsigned int cycle_idx = export_counter++;
+    auto write_triplets =
+        [cycle_idx](const SparseMatrix<Number> &A, const std::string &name,
+                    const unsigned int n_rows, const unsigned int n_cols) {
+          const std::string fname =
+              name + "_cycle" + Utilities::int_to_string(cycle_idx, 2) + ".txt";
+          std::ofstream out(fname);
+          out.precision(16);
+          out << std::scientific;
+          for (auto it = A.begin(); it != A.end(); ++it)
+            out << (it->row() + 1) << ' ' << (it->column() + 1) << ' '
+                << it->value() << '\n';
+          out << n_rows << ' ' << n_cols << " 0\n";
+          std::cout << "Wrote " << fname << " (" << n_rows << " x " << n_cols
+                    << ")" << std::endl;
+        };
+
+    std::cout << "Exporting matrices for eigenvalues analysis..." << std::endl;
+    write_triplets(stiffness_matrix_bg_unaug, "A", dof_handler_bg.n_dofs(),
+                   dof_handler_bg.n_dofs());
+    if (parameters.use_operator_form)
+      write_triplets(stiffness_matrix_bg, "A_aug", dof_handler_bg.n_dofs(),
+                     dof_handler_bg.n_dofs());
+    write_triplets(stiffness_matrix_fg, "A2", dof_handler_fg.n_dofs(),
+                   dof_handler_fg.n_dofs());
+    write_triplets(coupling_matrix, "Ct", dof_handler_bg.n_dofs(),
+                   dof_handler_fg.n_dofs());
+    write_triplets(mass_matrix_fg, "M", dof_handler_fg.n_dofs(),
+                   dof_handler_fg.n_dofs());
     std::cout << "Exporting matrices: done." << std::endl;
   }
 
